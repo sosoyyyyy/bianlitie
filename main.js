@@ -492,11 +492,10 @@ var BianlitieView = class extends import_obsidian5.ItemView {
       });
     }
     composer.createEl("h2", { text: "\u4ECA\u5929\u60F3\u8BB0\u70B9\u4EC0\u4E48\uFF1F", cls: "bianlitie-composer__prompt" });
-    composer.createEl("p", { text: "\u539F\u6587\u4F1A\u5B8C\u6574\u4FDD\u5B58\u4E3A\u72EC\u7ACB Markdown \u6587\u4EF6\u3002", cls: "bianlitie-helper" });
     const textarea = composer.createEl("textarea", {
       cls: "bianlitie-note-input",
       attr: {
-        rows: "8",
+        rows: "4",
         placeholder: "\u4ECE\u8FD9\u91CC\u5F00\u59CB\u8BB0\u5F55\u2026",
         "aria-label": "\u4FBF\u5229\u8D34\u5185\u5BB9"
       }
@@ -543,6 +542,8 @@ var BianlitieView = class extends import_obsidian5.ItemView {
     saveButton.addEventListener("click", () => {
       void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList);
     });
+    textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
+    this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
       this.searchTimer = window.setTimeout(() => {
@@ -553,7 +554,21 @@ var BianlitieView = class extends import_obsidian5.ItemView {
       new AskStickyNotesModal(this.app, this.storage, this.deepseek).open();
     });
     void this.runSearch("", resultStatus, resultList);
-    window.setTimeout(() => textarea.focus(), 0);
+    window.setTimeout(() => {
+      this.resizeNoteInput(textarea);
+      textarea.focus();
+    }, 0);
+  }
+  resizeNoteInput(textarea) {
+    const styles = window.getComputedStyle(textarea);
+    const minHeight = Number.parseFloat(styles.minHeight) || 132;
+    const maxHeight = Number.parseFloat(styles.maxHeight) || 232;
+    const borderHeight = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
+    textarea.style.height = "auto";
+    const contentHeight = textarea.scrollHeight + borderHeight;
+    const nextHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
   async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList) {
     const originalContent = textarea.value;
@@ -572,6 +587,7 @@ var BianlitieView = class extends import_obsidian5.ItemView {
     try {
       const file = await this.storage.createNote(category, originalContent);
       textarea.value = "";
+      this.resizeNoteInput(textarea);
       this.selectedCategory = null;
       for (const item of categoryButtons.values()) {
         item.removeClass("is-active");

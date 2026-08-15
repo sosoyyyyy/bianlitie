@@ -67,11 +67,10 @@ export class BianlitieView extends ItemView {
     }
 
     composer.createEl("h2", { text: "今天想记点什么？", cls: "bianlitie-composer__prompt" });
-    composer.createEl("p", { text: "原文会完整保存为独立 Markdown 文件。", cls: "bianlitie-helper" });
     const textarea = composer.createEl("textarea", {
       cls: "bianlitie-note-input",
       attr: {
-        rows: "8",
+        rows: "4",
         placeholder: "从这里开始记录…",
         "aria-label": "便利贴内容"
       }
@@ -122,6 +121,8 @@ export class BianlitieView extends ItemView {
     saveButton.addEventListener("click", () => {
       void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList);
     });
+    textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
+    this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
       this.searchTimer = window.setTimeout(() => {
@@ -133,7 +134,23 @@ export class BianlitieView extends ItemView {
     });
 
     void this.runSearch("", resultStatus, resultList);
-    window.setTimeout(() => textarea.focus(), 0);
+    window.setTimeout(() => {
+      this.resizeNoteInput(textarea);
+      textarea.focus();
+    }, 0);
+  }
+
+  private resizeNoteInput(textarea: HTMLTextAreaElement): void {
+    const styles = window.getComputedStyle(textarea);
+    const minHeight = Number.parseFloat(styles.minHeight) || 132;
+    const maxHeight = Number.parseFloat(styles.maxHeight) || 232;
+    const borderHeight = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
+
+    textarea.style.height = "auto";
+    const contentHeight = textarea.scrollHeight + borderHeight;
+    const nextHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
 
   private async saveNote(
@@ -161,6 +178,7 @@ export class BianlitieView extends ItemView {
     try {
       const file = await this.storage.createNote(category, originalContent);
       textarea.value = "";
+      this.resizeNoteInput(textarea);
       this.selectedCategory = null;
       for (const item of categoryButtons.values()) {
         item.removeClass("is-active");
