@@ -223,13 +223,7 @@ export class BianlitieView extends ItemView {
       const top = card.createDiv({ cls: "bianlitie-result-card__top" });
       top.createSpan({ text: record.category, cls: "bianlitie-category-chip" });
       top.createSpan({ text: record.created || "未记录时间", cls: "bianlitie-created" });
-      card.createEl("h3", { text: record.title });
-      card.createEl("p", { text: record.snippet || "（正文为空）", cls: "bianlitie-snippet" });
-      const labels = [...record.tags, ...record.keywords].slice(0, 5);
-      if (labels.length > 0) {
-        const labelRow = card.createDiv({ cls: "bianlitie-label-row" });
-        labels.forEach((label) => labelRow.createSpan({ text: label }));
-      }
+      card.createEl("p", { text: record.snippet || "暂无内容", cls: "bianlitie-body-preview" });
       card.addEventListener("click", () => {
         void this.app.workspace.getLeaf(false).openFile(record.file);
       });

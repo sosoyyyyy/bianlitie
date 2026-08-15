@@ -630,13 +630,7 @@ var BianlitieView = class extends import_obsidian5.ItemView {
       const top = card.createDiv({ cls: "bianlitie-result-card__top" });
       top.createSpan({ text: record.category, cls: "bianlitie-category-chip" });
       top.createSpan({ text: record.created || "\u672A\u8BB0\u5F55\u65F6\u95F4", cls: "bianlitie-created" });
-      card.createEl("h3", { text: record.title });
-      card.createEl("p", { text: record.snippet || "\uFF08\u6B63\u6587\u4E3A\u7A7A\uFF09", cls: "bianlitie-snippet" });
-      const labels = [...record.tags, ...record.keywords].slice(0, 5);
-      if (labels.length > 0) {
-        const labelRow = card.createDiv({ cls: "bianlitie-label-row" });
-        labels.forEach((label) => labelRow.createSpan({ text: label }));
-      }
+      card.createEl("p", { text: record.snippet || "\u6682\u65E0\u5185\u5BB9", cls: "bianlitie-body-preview" });
       card.addEventListener("click", () => {
         void this.app.workspace.getLeaf(false).openFile(record.file);
       });

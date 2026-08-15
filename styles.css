@@ -275,10 +275,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-width: 0;
   gap: 10px;
 }
 
 .bianlitie-category-chip {
+  flex: 0 0 auto;
   padding: 3px 9px;
   border-radius: 999px;
   color: #135dbf;
@@ -288,6 +290,7 @@
 }
 
 .bianlitie-created {
+  min-width: 0;
   overflow: hidden;
   color: #8292a6;
   font-size: 11px;
@@ -295,41 +298,21 @@
   white-space: nowrap;
 }
 
-.bianlitie-result-card h3 {
-  margin: 12px 0 7px;
-  overflow: hidden;
-  color: #1b3555;
-  font-size: 15px;
-  font-weight: 660;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.bianlitie-snippet {
+.bianlitie-body-preview {
   display: -webkit-box;
-  margin: 0;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin: 13px 0 0;
   overflow: hidden;
   color: #667b93;
   font-size: 13px;
   line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
-}
-
-.bianlitie-label-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 12px;
-}
-
-.bianlitie-label-row span {
-  padding: 3px 8px;
-  border: 1px solid #d8e6f6;
-  border-radius: 999px;
-  color: #617790;
-  background: #f8fbff;
-  font-size: 10px;
 }
 
 .bianlitie-empty {
