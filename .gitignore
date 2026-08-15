@@ -1,0 +1,17 @@
+node_modules/
+*.log
+
+# Local plugin settings and secrets
+data.json
+.env
+.env.*
+!.env.example
+
+# Editor, OS, and generated files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+coverage/
+dist/
+*.zip

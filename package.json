@@ -1,0 +1,33 @@
+{
+  "name": "bianlitie",
+  "version": "0.1.0",
+  "description": "跨 Windows、iOS 与 Android 的极简 Obsidian 便利贴插件",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
+    "check": "node scripts/check-build.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "memo",
+    "notes"
+  ],
+  "author": "私人使用",
+  "license": "0BSD",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sosoyyyyy/bianlitie.git"
+  },
+  "homepage": "https://github.com/sosoyyyyy/bianlitie#readme",
+  "bugs": {
+    "url": "https://github.com/sosoyyyyy/bianlitie/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "esbuild": "0.25.5",
+    "obsidian": "latest",
+    "typescript": "^5.8.3"
+  }
+}
