@@ -14,6 +14,7 @@
   --bianlitie-line: #dfe9f5;
   --bianlitie-white: #ffffff;
   --bianlitie-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --bianlitie-keyboard-height: 0px;
   color: var(--bianlitie-text);
   background: #f5f9ff;
   min-height: 100%;
@@ -759,6 +760,10 @@
   height: 18px;
 }
 
+.bianlitie-ask-button__label--compact {
+  display: none;
+}
+
 .modal.bianlitie-ask-modal {
   width: min(680px, calc(100vw - 30px));
   max-height: min(820px, calc(100vh - 30px));
@@ -966,7 +971,7 @@
   .bianlitie-shell {
     width: min(100% - 24px, 780px);
     padding-top: 28px;
-    padding-bottom: calc(158px + var(--bianlitie-safe-bottom));
+    padding-bottom: calc(158px + var(--bianlitie-safe-bottom) + var(--bianlitie-keyboard-height));
   }
 
   .bianlitie-header {
@@ -1048,12 +1053,38 @@
   }
 
   .bianlitie-ask-button {
+    box-sizing: border-box;
     right: 16px;
     bottom: calc(88px + var(--bianlitie-safe-bottom));
-    width: 124px;
-    min-height: 48px;
+    gap: 5px;
+    width: 64px;
+    height: 46px;
+    min-height: 46px;
     margin: 0;
-    padding: 9px 14px;
+    padding: 0 10px;
+    border-color: var(--bianlitie-blue);
+    color: #145dbf;
+    background: #ffffff;
+    box-shadow: none;
+    font-size: 16px;
+  }
+
+  .bianlitie-ask-button:hover {
+    color: #0e56bf;
+    background: #f7fbff;
+  }
+
+  .bianlitie-ask-button svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .bianlitie-ask-button__label--full {
+    display: none;
+  }
+
+  .bianlitie-ask-button__label--compact {
+    display: inline;
   }
 
   .bianlitie-settings input[type="text"],

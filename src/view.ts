@@ -58,6 +58,8 @@ export class BianlitieView extends ItemView {
   private composerDraft: ComposerDraft | null = null;
   private draft: DraftState | null = null;
   private searchUi: SearchUi | null = null;
+  private viewportCleanup: (() => void) | null = null;
+  private viewportFrame: number | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -169,12 +171,14 @@ export class BianlitieView extends ItemView {
     });
     const askIcon = askButton.createSpan();
     setIcon(askIcon, "message-circle-question");
-    askButton.createSpan({ text: "问便利贴" });
+    askButton.createSpan({ text: "问便利贴", cls: "bianlitie-ask-button__label bianlitie-ask-button__label--full" });
+    askButton.createSpan({ text: "问", cls: "bianlitie-ask-button__label bianlitie-ask-button__label--compact" });
 
     saveButton.addEventListener("click", () => {
       void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList, composerTags, composerImages);
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
+    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
@@ -182,10 +186,11 @@ export class BianlitieView extends ItemView {
     });
     askButton.addEventListener("click", () => new AskStickyNotesModal(this.app, this.storage, this.deepseek).open());
     this.registerVaultRefreshEvents(searchInput, resultStatus, resultList, container);
+    this.registerViewportHandling(container);
 
     void this.runSearch("", resultStatus, resultList);
     window.setTimeout(() => {
-      this.resizeNoteInput(textarea);
+      this.resizeNoteInput(textarea, true);
       textarea.focus();
     }, 0);
   }
@@ -263,15 +268,75 @@ export class BianlitieView extends ItemView {
     }, 250);
   }
 
-  private resizeNoteInput(textarea: HTMLTextAreaElement): void {
+  private resizeNoteInput(textarea: HTMLTextAreaElement, allowShrink = false): void {
     const styles = window.getComputedStyle(textarea);
     const minHeight = Number.parseFloat(styles.minHeight) || 132;
     const maxHeight = Number.parseFloat(styles.maxHeight) || 232;
     const borderHeight = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
-    textarea.style.height = "auto";
+    const currentHeight = textarea.getBoundingClientRect().height || minHeight;
+    if (allowShrink) textarea.style.height = "auto";
     const contentHeight = textarea.scrollHeight + borderHeight;
-    textarea.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
+    const stableHeight = allowShrink ? contentHeight : Math.max(contentHeight, currentHeight);
+    textarea.style.height = `${Math.min(Math.max(stableHeight, minHeight), maxHeight)}px`;
     textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
+  }
+
+  private registerViewportHandling(container: HTMLElement): void {
+    this.viewportCleanup?.();
+    const visualViewport = window.visualViewport;
+    const update = (): void => {
+      const viewportHeight = visualViewport?.height ?? window.innerHeight;
+      const measuredInset = visualViewport
+        ? Math.max(0, window.innerHeight - viewportHeight)
+        : 0;
+      const keyboardHeight = measuredInset >= 72 ? measuredInset : 0;
+      container.style.setProperty("--bianlitie-keyboard-height", `${Math.round(keyboardHeight)}px`);
+      container.style.setProperty("--bianlitie-visual-viewport-height", `${Math.round(viewportHeight)}px`);
+      container.toggleClass("is-keyboard-open", keyboardHeight > 0);
+      this.scheduleFocusedInputVisibility();
+    };
+
+    visualViewport?.addEventListener("resize", update);
+    visualViewport?.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+    this.viewportCleanup = () => {
+      visualViewport?.removeEventListener("resize", update);
+      visualViewport?.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      container.style.removeProperty("--bianlitie-keyboard-height");
+      container.style.removeProperty("--bianlitie-visual-viewport-height");
+      container.removeClass("is-keyboard-open");
+    };
+    update();
+  }
+
+  private scheduleFocusedInputVisibility(): void {
+    if (!window.matchMedia("(max-width: 600px)").matches) return;
+    if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
+    this.viewportFrame = window.requestAnimationFrame(() => {
+      this.viewportFrame = null;
+      this.keepFocusedInputVisible();
+    });
+  }
+
+  private keepFocusedInputVisible(): void {
+    const ui = this.searchUi;
+    const active = document.activeElement;
+    if (!ui || !(active instanceof HTMLTextAreaElement) || !active.isConnected) return;
+    if (!active.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
+
+    const visualViewport = window.visualViewport;
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const margin = 16;
+    const bounds = active.getBoundingClientRect();
+    const visibleTop = viewportTop + margin;
+    const visibleBottom = viewportBottom - margin;
+    if (bounds.bottom > visibleBottom) {
+      ui.scrollContainer.scrollTop += bounds.bottom - visibleBottom;
+    } else if (bounds.top < visibleTop) {
+      ui.scrollContainer.scrollTop -= visibleTop - bounds.top;
+    }
   }
 
   private async saveNote(
@@ -459,6 +524,7 @@ export class BianlitieView extends ItemView {
     });
     textarea.value = draft.body;
     textarea.disabled = draft.saving;
+    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
     });
@@ -896,6 +962,10 @@ export class BianlitieView extends ItemView {
   async onClose(): Promise<void> {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
+    if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
+    this.viewportFrame = null;
+    this.viewportCleanup?.();
+    this.viewportCleanup = null;
     if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
     if (this.draft) this.revokePendingImages(this.draft.pendingImages);
     this.composerDraft = null;
