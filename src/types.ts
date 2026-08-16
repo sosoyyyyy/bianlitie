@@ -16,6 +16,8 @@ export interface StickyNoteRecord {
   title: string;
   category: Category;
   created: string;
+  modified: string;
+  modifiedTimestamp: number;
   tags: string[];
   keywords: string[];
   body: string;

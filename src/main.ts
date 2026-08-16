@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFile } from "obsidian";
 import { VIEW_TYPE_BIANLITIE, DEFAULT_MODEL } from "./constants";
 import { DeepSeekClient } from "./deepseek";
 import { BianlitieSettingTab } from "./settings";
@@ -35,6 +35,13 @@ export default class BianlitiePlugin extends Plugin {
         void this.activateView();
       }
     });
+    this.addCommand({
+      id: "regenerate-current-note-metadata",
+      name: "重新生成当前便利贴标签",
+      callback: () => {
+        void this.regenerateCurrentNoteMetadata();
+      }
+    });
     this.addSettingTab(new BianlitieSettingTab(this.app, this));
 
     try {
@@ -47,6 +54,41 @@ export default class BianlitiePlugin extends Plugin {
 
   onunload(): void {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_BIANLITIE);
+  }
+
+  private async regenerateCurrentNoteMetadata(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || !this.storage.isManagedFile(file)) {
+      new Notice("请先打开一条便利贴 Markdown 文件。");
+      return;
+    }
+
+    try {
+      const note = await this.storage.readNote(file);
+      if (!note.body.trim()) {
+        new Notice("便利贴正文为空，无法生成标签。");
+        return;
+      }
+      if (!this.deepseek.isConfigured()) {
+        new Notice("请先在便利贴设置中填写 DeepSeek API Key 和模型名称。");
+        return;
+      }
+
+      const metadata = await this.deepseek.generateMetadata(note.body, note.category);
+      const current = this.app.vault.getAbstractFileByPath(file.path);
+      if (!(current instanceof TFile) || !this.storage.isManagedFile(current)) return;
+      const latest = await this.storage.readNote(current);
+      if (latest.body !== note.body) {
+        new Notice("正文在生成标签期间发生了变化，请重试。");
+        return;
+      }
+
+      await this.storage.updateGeneratedMetadata(current, metadata);
+      new Notice("便利贴标签已重新生成");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "标签生成失败，请稍后重试。";
+      new Notice(message);
+    }
   }
 
   async activateView(): Promise<void> {

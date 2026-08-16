@@ -7,17 +7,30 @@ import {
   formatFileTimestamp,
   makeSnippet,
   normalizeList,
-  sanitizeFilePart,
-  stripFrontmatter,
-  titleFromContent
+  parseCreated,
+  stripFrontmatter
 } from "./utils";
 
-interface ParsedNote {
+export interface ParsedNote {
   category: Category;
   created: string;
+  updated: string;
   tags: string[];
   keywords: string[];
   body: string;
+}
+
+export interface NoteSnapshot {
+  note: ParsedNote;
+  raw: string;
+  mtime: number;
+}
+
+export class NoteConflictError extends Error {
+  constructor() {
+    super("这条便利贴在编辑期间已发生变化，请重新载入后再编辑。");
+    this.name = "NoteConflictError";
+  }
 }
 
 export class StickyNoteStorage {
@@ -41,13 +54,13 @@ export class StickyNoteStorage {
     await this.ensureFolders();
     const now = new Date();
     const folder = normalizePath(`${ROOT_FOLDER}/${category}`);
-    const titlePart = sanitizeFilePart(titleFromContent(originalContent));
-    const baseName = `${formatFileTimestamp(now)}-${titlePart}`;
+    const baseName = formatFileTimestamp(now);
     const path = this.uniquePath(folder, baseName);
     const frontmatter = [
       "---",
       `category: ${category}`,
       `created: ${formatCreated(now)}`,
+      `updated: ${formatCreated(now)}`,
       "tags: []",
       "keywords: []",
       "---",
@@ -76,13 +89,49 @@ export class StickyNoteStorage {
     });
   }
 
+  async readNote(file: TFile): Promise<ParsedNote> {
+    if (!this.isManagedFile(file)) throw new Error("这不是便利贴目录中的 Markdown 文件。");
+    const raw = await this.app.vault.read(file);
+    return this.parseNote(raw, file);
+  }
+
+  async readNoteSnapshot(file: TFile): Promise<NoteSnapshot> {
+    if (!this.isManagedFile(file)) throw new Error("这不是便利贴目录中的 Markdown 文件。");
+    const raw = await this.app.vault.read(file);
+    return {
+      note: this.parseNote(raw, file),
+      raw,
+      mtime: file.stat.mtime
+    };
+  }
+
+  async updateNoteBody(file: TFile, expectedRaw: string, body: string, updatedAt: Date): Promise<void> {
+    if (!this.isManagedFile(file)) throw new Error("拒绝修改便利贴目录之外的文件。");
+    await this.app.vault.process(file, (currentRaw) => {
+      if (currentRaw !== expectedRaw) throw new NoteConflictError();
+      return this.replaceBodyAndUpdated(currentRaw, body, updatedAt);
+    });
+  }
+
+  async trashNote(file: TFile): Promise<void> {
+    if (!this.isManagedFile(file)) throw new Error("拒绝删除便利贴目录之外的文件。");
+    const fileManager = this.app.fileManager as typeof this.app.fileManager & {
+      trashFile?: (target: TFile) => Promise<void>;
+    };
+    if (typeof fileManager.trashFile === "function") {
+      await fileManager.trashFile(file);
+      return;
+    }
+    await this.app.vault.trash(file, false);
+  }
+
   async search(query: string, category: CategoryFilter = "全部", limit = 50): Promise<StickyNoteRecord[]> {
     const terms = extractSearchTerms(query);
     const records: StickyNoteRecord[] = [];
     const files = this.app.vault.getMarkdownFiles().filter((file) => this.isManagedFile(file));
 
     for (const file of files) {
-      const raw = await this.app.vault.cachedRead(file);
+      const raw = await this.app.vault.read(file);
       const parsed = this.parseNote(raw, file);
       if (category !== "全部" && parsed.category !== category) continue;
 
@@ -91,7 +140,7 @@ export class StickyNoteStorage {
     }
 
     return records
-      .sort((left, right) => right.score - left.score || right.file.stat.ctime - left.file.stat.ctime)
+      .sort((left, right) => right.modifiedTimestamp - left.modifiedTimestamp || right.score - left.score)
       .slice(0, limit);
   }
 
@@ -99,13 +148,15 @@ export class StickyNoteStorage {
     return this.search(question, "全部", limit);
   }
 
-  private isManagedFile(file: TFile): boolean {
-    return file.extension.toLocaleLowerCase() === "md" && file.path.startsWith(`${ROOT_FOLDER}/`);
+  isManagedFile(file: TFile): boolean {
+    return file.extension.toLocaleLowerCase() === "md"
+      && CATEGORIES.some((category) => file.path.startsWith(`${ROOT_FOLDER}/${category}/`));
   }
 
   private toRecord(file: TFile, parsed: ParsedNote, query: string, terms: string[]): StickyNoteRecord {
-    const title = file.basename;
-    const titleText = title.toLocaleLowerCase();
+    const title = makeSnippet(parsed.body, 80) || "暂无内容";
+    const modifiedTimestamp = parseCreated(parsed.updated) || file.stat.mtime;
+    const titleText = `${file.basename} ${title}`.toLocaleLowerCase();
     const tagText = parsed.tags.join(" ").toLocaleLowerCase();
     const keywordText = parsed.keywords.join(" ").toLocaleLowerCase();
     const bodyText = parsed.body.toLocaleLowerCase();
@@ -125,6 +176,8 @@ export class StickyNoteStorage {
       title,
       category: parsed.category,
       created: parsed.created,
+      modified: parsed.updated || formatCreated(new Date(file.stat.mtime)),
+      modifiedTimestamp,
       tags: parsed.tags,
       keywords: parsed.keywords,
       body: parsed.body,
@@ -134,21 +187,35 @@ export class StickyNoteStorage {
   }
 
   private parseNote(raw: string, file: TFile): ParsedNote {
-    const cache = this.app.metadataCache.getFileCache(file)?.frontmatter;
     const folderCategory = CATEGORIES.find((category) => file.path.startsWith(`${ROOT_FOLDER}/${category}/`));
-    const cachedCategory = cache?.category;
-    const category = CATEGORIES.find((item) => item === cachedCategory) ?? folderCategory ?? "工作";
-    const created = typeof cache?.created === "string" ? cache.created : this.readScalar(raw, "created");
-    const tags = normalizeList(cache?.tags ?? this.readList(raw, "tags"));
-    const keywords = normalizeList(cache?.keywords ?? this.readList(raw, "keywords"));
+    const storedCategory = this.readScalar(raw, "category");
+    const category = CATEGORIES.find((item) => item === storedCategory) ?? folderCategory ?? "工作";
+    const created = this.readScalar(raw, "created");
+    const updated = this.readScalar(raw, "updated");
+    const tags = normalizeList(this.readList(raw, "tags"));
+    const keywords = normalizeList(this.readList(raw, "keywords"));
 
     return {
       category,
       created,
+      updated,
       tags,
       keywords,
       body: stripFrontmatter(raw)
     };
+  }
+
+  private replaceBodyAndUpdated(raw: string, body: string, updatedAt: Date): string {
+    const match = raw.match(/^---(\r?\n)([\s\S]*?)(\r?\n)---(?:\r?\n)?/u);
+    if (!match) throw new Error("便利贴缺少可识别的 YAML frontmatter，已停止保存以避免损坏文件。");
+
+    const newline = match[1] ?? "\n";
+    const frontmatter = match[2] ?? "";
+    const updatedLine = `updated: ${formatCreated(updatedAt)}`;
+    const nextFrontmatter = /^updated:\s*.*$/mu.test(frontmatter)
+      ? frontmatter.replace(/^updated:\s*.*$/mu, updatedLine)
+      : `${frontmatter}${frontmatter ? newline : ""}${updatedLine}`;
+    return `---${newline}${nextFrontmatter}${newline}---${newline}${body}`;
   }
 
   private readScalar(raw: string, field: string): string {
