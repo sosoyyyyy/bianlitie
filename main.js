@@ -23,11 +23,13 @@ __export(main_exports, {
   default: () => BianlitiePlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian7 = require("obsidian");
+var import_obsidian8 = require("obsidian");
 
 // src/constants.ts
 var VIEW_TYPE_BIANLITIE = "bianlitie-view";
 var ROOT_FOLDER = "\u4FBF\u5229\u8D34";
+var ATTACHMENT_ROOT = "attachments/bianlitie";
+var MAX_IMAGES_PER_NOTE = 5;
 var CATEGORIES = ["\u751F\u6D3B", "\u526F\u4E1A", "\u5DE5\u4F5C"];
 var DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions";
 var DEFAULT_MODEL = "deepseek-chat";
@@ -66,6 +68,38 @@ function normalizeList(values, maxItems = 8) {
   const result = [];
   for (const item of raw) {
     const value = String(item).replace(/^#+/u, "").replace(/[\r\n]/gu, " ").trim().slice(0, 40);
+    if (value && !result.includes(value)) result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+function normalizeManualTag(value) {
+  return value.replace(/^#+/u, "").replace(/[\r\n]/gu, " ").replace(/\s+/gu, " ").trim().slice(0, 30);
+}
+function normalizeManualTags(values, maxItems = 20) {
+  const raw = Array.isArray(values) ? values : typeof values === "string" ? [values] : [];
+  const result = [];
+  for (const item of raw) {
+    const value = normalizeManualTag(String(item));
+    if (value && !result.includes(value)) result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+function sanitizeAttachmentFileName(fileName) {
+  const cleaned = fileName.replace(/[\\/:*?"<>|\[\]\u0000-\u001f]/gu, " ").replace(/\s+/gu, " ").trim().replace(/[. ]+$/gu, "");
+  if (!cleaned) return "image";
+  const dotIndex = cleaned.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === cleaned.length - 1) return cleaned.slice(0, 80);
+  const base = cleaned.slice(0, dotIndex).trim().slice(0, 70) || "image";
+  const extension = cleaned.slice(dotIndex + 1).replace(/[^a-zA-Z0-9]/gu, "").slice(0, 10);
+  return extension ? `${base}.${extension}` : base;
+}
+function normalizeImagePaths(values, maxItems = 5) {
+  const raw = Array.isArray(values) ? values : typeof values === "string" ? [values] : [];
+  const result = [];
+  for (const item of raw) {
+    const value = String(item).replace(/[\r\n]/gu, "").trim().slice(0, 500);
     if (value && !result.includes(value)) result.push(value);
     if (result.length >= maxItems) break;
   }
@@ -235,7 +269,7 @@ var StickyNoteStorage = class {
     if (existing) throw new Error(`${path} \u5DF2\u5B58\u5728\uFF0C\u4F46\u4E0D\u662F\u6587\u4EF6\u5939\u3002`);
     await this.app.vault.createFolder(path);
   }
-  async createNote(category, originalContent) {
+  async createNote(category, originalContent, manualTags = []) {
     await this.ensureFolders();
     const now = /* @__PURE__ */ new Date();
     const folder = (0, import_obsidian3.normalizePath)(`${ROOT_FOLDER}/${category}`);
@@ -248,6 +282,8 @@ var StickyNoteStorage = class {
       `updated: ${formatCreated(now)}`,
       "tags: []",
       "keywords: []",
+      `manualTags: ${JSON.stringify(normalizeManualTags(manualTags))}`,
+      "images: []",
       "---",
       ""
     ].join("\n");
@@ -271,6 +307,47 @@ var StickyNoteStorage = class {
       frontmatter.keywords = keywords;
     });
   }
+  async saveImages(uploads, savedAt = /* @__PURE__ */ new Date()) {
+    if (uploads.length > MAX_IMAGES_PER_NOTE) throw new Error(`\u6BCF\u6761\u4FBF\u5229\u8D34\u6700\u591A\u6DFB\u52A0 ${MAX_IMAGES_PER_NOTE} \u5F20\u56FE\u7247\u3002`);
+    const folder = (0, import_obsidian3.normalizePath)(`${ATTACHMENT_ROOT}/${savedAt.getFullYear()}/${pad(savedAt.getMonth() + 1)}`);
+    await this.ensureFolderTree(folder);
+    const created = [];
+    try {
+      for (const upload of uploads) {
+        const fileName = this.ensureImageExtension(sanitizeAttachmentFileName(upload.name), upload.mimeType);
+        const path = this.uniqueAttachmentPath(folder, fileName);
+        created.push(await this.app.vault.createBinary(path, upload.data));
+      }
+      return created.map((file) => file.path);
+    } catch (error) {
+      for (const file of created) {
+        try {
+          await this.app.vault.trash(file, false);
+        } catch {
+        }
+      }
+      throw error;
+    }
+  }
+  async discardCreatedImages(paths) {
+    for (const path of normalizeImagePaths(paths, MAX_IMAGES_PER_NOTE)) {
+      if (!this.isManagedAttachmentPath(path)) continue;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof import_obsidian3.TFile)) continue;
+      try {
+        await this.app.vault.trash(file, false);
+      } catch (error) {
+        console.warn("\u65E0\u6CD5\u56DE\u6536\u672A\u7ED1\u5B9A\u7684\u4FBF\u5229\u8D34\u9644\u4EF6\u3002", error);
+      }
+    }
+  }
+  getImageResourcePath(path) {
+    const file = this.app.vault.getAbstractFileByPath((0, import_obsidian3.normalizePath)(path));
+    if (!(file instanceof import_obsidian3.TFile)) return null;
+    const resource = this.app.vault.getResourcePath(file);
+    const separator = resource.includes("?") ? "&" : "?";
+    return `${resource}${separator}bianlitieMtime=${file.stat.mtime}`;
+  }
   async readNote(file) {
     if (!this.isManagedFile(file)) throw new Error("\u8FD9\u4E0D\u662F\u4FBF\u5229\u8D34\u76EE\u5F55\u4E2D\u7684 Markdown \u6587\u4EF6\u3002");
     const raw = await this.app.vault.read(file);
@@ -285,12 +362,24 @@ var StickyNoteStorage = class {
       mtime: file.stat.mtime
     };
   }
-  async updateNoteBody(file, expectedRaw, body, updatedAt) {
+  async updateNote(file, expectedRaw, body, manualTags, images, updatedAt) {
     if (!this.isManagedFile(file)) throw new Error("\u62D2\u7EDD\u4FEE\u6539\u4FBF\u5229\u8D34\u76EE\u5F55\u4E4B\u5916\u7684\u6587\u4EF6\u3002");
     await this.app.vault.process(file, (currentRaw) => {
       if (currentRaw !== expectedRaw) throw new NoteConflictError();
-      return this.replaceBodyAndUpdated(currentRaw, body, updatedAt);
+      return this.replaceBodyAndUserMetadata(currentRaw, body, manualTags, images, updatedAt);
     });
+  }
+  async updateImagePath(oldPath, newPath) {
+    const normalizedOld = (0, import_obsidian3.normalizePath)(oldPath);
+    const normalizedNew = (0, import_obsidian3.normalizePath)(newPath);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => this.isManagedFile(file));
+    for (const file of files) {
+      const note = await this.readNote(file);
+      if (!note.images.includes(normalizedOld)) continue;
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        frontmatter.images = normalizeImagePaths(note.images.map((path) => path === normalizedOld ? normalizedNew : path));
+      });
+    }
   }
   async trashNote(file) {
     if (!this.isManagedFile(file)) throw new Error("\u62D2\u7EDD\u5220\u9664\u4FBF\u5229\u8D34\u76EE\u5F55\u4E4B\u5916\u7684\u6587\u4EF6\u3002");
@@ -320,22 +409,33 @@ var StickyNoteStorage = class {
   isManagedFile(file) {
     return file.extension.toLocaleLowerCase() === "md" && CATEGORIES.some((category) => file.path.startsWith(`${ROOT_FOLDER}/${category}/`));
   }
+  isManagedAttachmentPath(path) {
+    const normalized = (0, import_obsidian3.normalizePath)(path);
+    return normalized === ATTACHMENT_ROOT || normalized.startsWith(`${ATTACHMENT_ROOT}/`);
+  }
+  isImagePath(path) {
+    return /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/iu.test(path);
+  }
   toRecord(file, parsed, query, terms) {
     const title = makeSnippet(parsed.body, 80) || "\u6682\u65E0\u5185\u5BB9";
     const modifiedTimestamp = parseCreated(parsed.updated) || file.stat.mtime;
     const titleText = `${file.basename} ${title}`.toLocaleLowerCase();
     const tagText = parsed.tags.join(" ").toLocaleLowerCase();
+    const manualTagText = parsed.manualTags.join(" ").toLocaleLowerCase();
     const keywordText = parsed.keywords.join(" ").toLocaleLowerCase();
     const bodyText = parsed.body.toLocaleLowerCase();
+    const categoryText = parsed.category.toLocaleLowerCase();
     let score = 0;
     for (const term of terms) {
       if (titleText.includes(term)) score += 10;
+      if (manualTagText.includes(term)) score += 11;
       if (tagText.includes(term)) score += 9;
       if (keywordText.includes(term)) score += 8;
+      if (categoryText.includes(term)) score += 7;
       if (bodyText.includes(term)) score += 3;
     }
     const exact = query.toLocaleLowerCase().trim();
-    if (exact && `${titleText} ${tagText} ${keywordText} ${bodyText}`.includes(exact)) score += 12;
+    if (exact && `${titleText} ${manualTagText} ${tagText} ${keywordText} ${categoryText} ${bodyText}`.includes(exact)) score += 12;
     return {
       file,
       title,
@@ -345,6 +445,8 @@ var StickyNoteStorage = class {
       modifiedTimestamp,
       tags: parsed.tags,
       keywords: parsed.keywords,
+      manualTags: parsed.manualTags,
+      images: parsed.images,
       body: parsed.body,
       snippet: makeSnippet(parsed.body),
       score
@@ -358,23 +460,87 @@ var StickyNoteStorage = class {
     const updated = this.readScalar(raw, "updated");
     const tags = normalizeList(this.readList(raw, "tags"));
     const keywords = normalizeList(this.readList(raw, "keywords"));
+    const manualTags = normalizeManualTags(this.readList(raw, "manualTags"));
+    const images = normalizeImagePaths(this.readList(raw, "images"), MAX_IMAGES_PER_NOTE);
     return {
       category,
       created,
       updated,
       tags,
       keywords,
+      manualTags,
+      images,
       body: stripFrontmatter(raw)
     };
   }
-  replaceBodyAndUpdated(raw, body, updatedAt) {
+  replaceBodyAndUserMetadata(raw, body, manualTags, images, updatedAt) {
     const match = raw.match(/^---(\r?\n)([\s\S]*?)(\r?\n)---(?:\r?\n)?/u);
     if (!match) throw new Error("\u4FBF\u5229\u8D34\u7F3A\u5C11\u53EF\u8BC6\u522B\u7684 YAML frontmatter\uFF0C\u5DF2\u505C\u6B62\u4FDD\u5B58\u4EE5\u907F\u514D\u635F\u574F\u6587\u4EF6\u3002");
     const newline = match[1] ?? "\n";
-    const frontmatter = match[2] ?? "";
-    const updatedLine = `updated: ${formatCreated(updatedAt)}`;
-    const nextFrontmatter = /^updated:\s*.*$/mu.test(frontmatter) ? frontmatter.replace(/^updated:\s*.*$/mu, updatedLine) : `${frontmatter}${frontmatter ? newline : ""}${updatedLine}`;
+    let nextFrontmatter = match[2] ?? "";
+    nextFrontmatter = this.replaceFrontmatterField(
+      nextFrontmatter,
+      "manualTags",
+      JSON.stringify(normalizeManualTags(manualTags)),
+      newline
+    );
+    nextFrontmatter = this.replaceFrontmatterField(
+      nextFrontmatter,
+      "images",
+      JSON.stringify(normalizeImagePaths(images, MAX_IMAGES_PER_NOTE)),
+      newline
+    );
+    if (updatedAt) {
+      nextFrontmatter = this.replaceFrontmatterField(nextFrontmatter, "updated", formatCreated(updatedAt), newline);
+    }
     return `---${newline}${nextFrontmatter}${newline}---${newline}${body}`;
+  }
+  replaceFrontmatterField(frontmatter, field, value, newline) {
+    const lines = frontmatter.split(/\r?\n/u);
+    const start = lines.findIndex((line) => new RegExp(`^${field}:`, "u").test(line));
+    const replacement = `${field}: ${value}`;
+    if (start < 0) return `${frontmatter}${frontmatter ? newline : ""}${replacement}`;
+    let end = start + 1;
+    while (end < lines.length && /^\s+/u.test(lines[end] ?? "")) end += 1;
+    lines.splice(start, end - start, replacement);
+    return lines.join(newline);
+  }
+  async ensureFolderTree(path) {
+    const segments = (0, import_obsidian3.normalizePath)(path).split("/").filter(Boolean);
+    let current = "";
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      await this.ensureFolder(current);
+    }
+  }
+  uniqueAttachmentPath(folder, fileName) {
+    const dotIndex = fileName.lastIndexOf(".");
+    const hasExtension = dotIndex > 0 && dotIndex < fileName.length - 1;
+    const base = hasExtension ? fileName.slice(0, dotIndex) : fileName;
+    const extension = hasExtension ? fileName.slice(dotIndex) : "";
+    let counter = 1;
+    while (true) {
+      const suffix = counter === 1 ? "" : `-${counter}`;
+      const candidate = (0, import_obsidian3.normalizePath)(`${folder}/${base}${suffix}${extension}`);
+      if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
+      counter += 1;
+    }
+  }
+  ensureImageExtension(fileName, mimeType) {
+    if (/\.[a-zA-Z0-9]{1,10}$/u.test(fileName)) return fileName;
+    const extensions = {
+      "image/avif": "avif",
+      "image/bmp": "bmp",
+      "image/gif": "gif",
+      "image/heic": "heic",
+      "image/heif": "heif",
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/svg+xml": "svg",
+      "image/webp": "webp"
+    };
+    const extension = extensions[mimeType.toLocaleLowerCase()] ?? "jpg";
+    return `${fileName}.${extension}`;
   }
   readScalar(raw, field) {
     const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/u)?.[1] ?? "";
@@ -383,9 +549,14 @@ var StickyNoteStorage = class {
   }
   readList(raw, field) {
     const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/u)?.[1] ?? "";
-    const inlineMatch = frontmatter.match(new RegExp(`^${field}:\\s*\\[([^\\]]*)\\]`, "mu"));
+    const inlineMatch = frontmatter.match(new RegExp(`^${field}:\\s*(\\[[^\\r\\n]*\\])\\s*$`, "mu"));
     if (inlineMatch) {
-      return (inlineMatch[1] ?? "").split(",").map((item) => item.trim().replace(/^['"]|['"]$/gu, "")).filter(Boolean);
+      try {
+        const parsed = JSON.parse(inlineMatch[1] ?? "[]");
+        if (Array.isArray(parsed)) return parsed.map((item) => String(item));
+      } catch {
+      }
+      return (inlineMatch[1] ?? "").replace(/^\[|\]$/gu, "").split(",").map((item) => item.trim().replace(/^['"]|['"]$/gu, "")).filter(Boolean);
     }
     const blockMatch = frontmatter.match(new RegExp(`^${field}:\\s*\\r?\\n((?:\\s+-\\s+.*(?:\\r?\\n|$))*)`, "mu"));
     if (!blockMatch) return [];
@@ -394,7 +565,7 @@ var StickyNoteStorage = class {
 };
 
 // src/view.ts
-var import_obsidian6 = require("obsidian");
+var import_obsidian7 = require("obsidian");
 
 // src/action-modal.ts
 var import_obsidian4 = require("obsidian");
@@ -522,17 +693,44 @@ var AskStickyNotesModal = class extends import_obsidian5.Modal {
   }
 };
 
+// src/image-modal.ts
+var import_obsidian6 = require("obsidian");
+var BianlitieImageModal = class extends import_obsidian6.Modal {
+  constructor(app, source, altText) {
+    super(app);
+    this.source = source;
+    this.altText = altText;
+  }
+  onOpen() {
+    this.modalEl.addClass("bianlitie-image-modal");
+    this.contentEl.empty();
+    const image = this.contentEl.createEl("img", {
+      cls: "bianlitie-image-modal__image",
+      attr: { src: this.source, alt: this.altText }
+    });
+    image.addEventListener("click", () => this.close());
+    if (this.altText) this.contentEl.createEl("p", { text: this.altText, cls: "bianlitie-image-modal__caption" });
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
 // src/view.ts
-var BianlitieView = class extends import_obsidian6.ItemView {
-  constructor(leaf, storage, deepseek) {
+var BianlitieView = class extends import_obsidian7.ItemView {
+  constructor(leaf, storage, deepseek, getManualTagHistory, rememberManualTags) {
     super(leaf);
     this.storage = storage;
     this.deepseek = deepseek;
+    this.getManualTagHistory = getManualTagHistory;
+    this.rememberManualTags = rememberManualTags;
     this.selectedCategory = null;
     this.searchCategory = "\u5168\u90E8";
     this.searchTimer = null;
     this.vaultRefreshTimer = null;
     this.searchSequence = 0;
+    this.pendingImageSequence = 0;
+    this.composerDraft = null;
     this.draft = null;
     this.searchUi = null;
   }
@@ -556,7 +754,7 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     const header = shell.createEl("header", { cls: "bianlitie-header" });
     const brand = header.createDiv({ cls: "bianlitie-brand" });
     const brandIcon = brand.createSpan({ cls: "bianlitie-brand__icon" });
-    (0, import_obsidian6.setIcon)(brandIcon, "sticky-note");
+    (0, import_obsidian7.setIcon)(brandIcon, "sticky-note");
     brand.createEl("h1", { text: "\u4FBF\u5229\u8D34" });
     header.createEl("p", { text: "\u8BB0\u4E0B\u6B64\u523B\uFF0C\u968F\u65F6\u627E\u56DE\u3002" });
     const composer = shell.createEl("section", { cls: "bianlitie-card bianlitie-composer" });
@@ -579,12 +777,13 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     composer.createEl("h2", { text: "\u4ECA\u5929\u60F3\u8BB0\u70B9\u4EC0\u4E48\uFF1F", cls: "bianlitie-composer__prompt" });
     const textarea = composer.createEl("textarea", {
       cls: "bianlitie-note-input",
-      attr: {
-        rows: "4",
-        placeholder: "\u4ECE\u8FD9\u91CC\u5F00\u59CB\u8BB0\u5F55\u2026",
-        "aria-label": "\u4FBF\u5229\u8D34\u5185\u5BB9"
-      }
+      attr: { rows: "4", placeholder: "\u4ECE\u8FD9\u91CC\u5F00\u59CB\u8BB0\u5F55\u2026", "aria-label": "\u4FBF\u5229\u8D34\u5185\u5BB9" }
     });
+    this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
+    const composerExtras = composer.createDiv({ cls: "bianlitie-composer-extras" });
+    const composerTags = composerExtras.createDiv();
+    const composerImages = composerExtras.createDiv();
+    this.renderComposerExtras(composerTags, composerImages);
     const saveButton = composer.createEl("button", {
       text: "\u5B58\u8FDB\u4FBF\u5229\u8D34",
       cls: "bianlitie-primary-button bianlitie-save-button",
@@ -594,7 +793,7 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     searchSection.createEl("h2", { text: "\u7FFB\u770B\u4FBF\u5229\u8D34" });
     const searchWrap = searchSection.createDiv({ cls: "bianlitie-search-wrap" });
     const searchIcon = searchWrap.createSpan({ cls: "bianlitie-search-icon" });
-    (0, import_obsidian6.setIcon)(searchIcon, "search");
+    (0, import_obsidian7.setIcon)(searchIcon, "search");
     const searchInput = searchWrap.createEl("input", {
       type: "search",
       attr: { placeholder: "\u641C\u7D22\u6B63\u6587\u3001\u6807\u9898\u3001\u6807\u7B7E\u6216\u5173\u952E\u8BCD", "aria-label": "\u641C\u7D22\u4FBF\u5229\u8D34" }
@@ -623,22 +822,18 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       attr: { type: "button", "aria-label": "\u95EE\u4FBF\u5229\u8D34" }
     });
     const askIcon = askButton.createSpan();
-    (0, import_obsidian6.setIcon)(askIcon, "message-circle-question");
+    (0, import_obsidian7.setIcon)(askIcon, "message-circle-question");
     askButton.createSpan({ text: "\u95EE\u4FBF\u5229\u8D34" });
     saveButton.addEventListener("click", () => {
-      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList);
+      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList, composerTags, composerImages);
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
-      this.searchTimer = window.setTimeout(() => {
-        void this.runSearch(searchInput.value, resultStatus, resultList);
-      }, 180);
+      this.searchTimer = window.setTimeout(() => void this.runSearch(searchInput.value, resultStatus, resultList), 180);
     });
-    askButton.addEventListener("click", () => {
-      new AskStickyNotesModal(this.app, this.storage, this.deepseek).open();
-    });
+    askButton.addEventListener("click", () => new AskStickyNotesModal(this.app, this.storage, this.deepseek).open());
     this.registerVaultRefreshEvents(searchInput, resultStatus, resultList, container);
     void this.runSearch("", resultStatus, resultList);
     window.setTimeout(() => {
@@ -646,23 +841,46 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       textarea.focus();
     }, 0);
   }
+  renderComposerExtras(tagHost, imageHost) {
+    this.renderManualTagEditor(
+      tagHost,
+      () => this.composerDraft?.manualTags ?? [],
+      (tags) => {
+        if (this.composerDraft) this.composerDraft.manualTags = tags;
+      },
+      () => this.composerDraft?.saving ?? true
+    );
+    this.renderImageEditor(
+      imageHost,
+      () => [],
+      () => void 0,
+      () => this.composerDraft?.pendingImages ?? [],
+      (images) => {
+        if (this.composerDraft) this.composerDraft.pendingImages = images;
+      },
+      () => this.composerDraft?.saving ?? true
+    );
+  }
   registerVaultRefreshEvents(searchInput, status, list, scrollContainer) {
     const scheduleForPaths = (...paths) => {
-      if (paths.some((path) => this.isManagedNotePath(path))) {
+      if (paths.some((path) => this.isManagedNotePath(path) || this.storage.isManagedAttachmentPath(path))) {
         this.scheduleVaultRefresh(searchInput, status, list, scrollContainer);
       }
     };
     this.registerEvent(this.app.vault.on("modify", (file) => scheduleForPaths(file.path)));
     this.registerEvent(this.app.vault.on("create", (file) => scheduleForPaths(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (this.draft?.path === file.path) this.draft = null;
+      if (this.draft?.path === file.path) {
+        this.revokePendingImages(this.draft.pendingImages);
+        this.draft = null;
+      }
       scheduleForPaths(file.path);
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (this.draft?.path === oldPath) {
-        if (this.isManagedNotePath(file.path)) {
-          this.draft.path = file.path;
-        } else {
+        if (this.isManagedNotePath(file.path)) this.draft.path = file.path;
+        else {
+          this.revokePendingImages(this.draft.pendingImages);
           this.draft = null;
         }
       }
@@ -692,26 +910,48 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     const borderHeight = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
     textarea.style.height = "auto";
     const contentHeight = textarea.scrollHeight + borderHeight;
-    const nextHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
-    textarea.style.height = `${nextHeight}px`;
+    textarea.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
     textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
-  async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList) {
+  async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList, tagHost, imageHost) {
     const originalContent = textarea.value;
+    const composerDraft = this.composerDraft;
+    if (!composerDraft || composerDraft.saving) return;
     if (!originalContent.trim()) {
-      new import_obsidian6.Notice("\u8BF7\u5148\u5199\u4E0B\u8981\u8BB0\u5F55\u7684\u5185\u5BB9\u3002");
+      new import_obsidian7.Notice("\u8BF7\u5148\u5199\u4E0B\u8981\u8BB0\u5F55\u7684\u5185\u5BB9\u3002");
       textarea.focus();
       return;
     }
     if (!this.selectedCategory) {
-      new import_obsidian6.Notice("\u4FDD\u5B58\u524D\u8BF7\u9009\u62E9\u5DE5\u4F5C\u3001\u751F\u6D3B\u6216\u526F\u4E1A\u3002");
+      new import_obsidian7.Notice("\u4FDD\u5B58\u524D\u8BF7\u9009\u62E9\u5DE5\u4F5C\u3001\u751F\u6D3B\u6216\u526F\u4E1A\u3002");
       return;
     }
     const category = this.selectedCategory;
+    const manualTags = [...composerDraft.manualTags];
+    const pendingImages = [...composerDraft.pendingImages];
+    composerDraft.saving = true;
     button.disabled = true;
     button.setText("\u6B63\u5728\u4FDD\u5B58\u2026");
+    this.renderComposerExtras(tagHost, imageHost);
     try {
-      const file = await this.storage.createNote(category, originalContent);
+      const file = await this.storage.createNote(category, originalContent, manualTags);
+      if (pendingImages.length > 0) {
+        let imagePaths = [];
+        try {
+          const uploads = await this.toImageUploads(pendingImages);
+          imagePaths = await this.storage.saveImages(uploads);
+          const snapshot = await this.storage.readNoteSnapshot(file);
+          await this.storage.updateNote(file, snapshot.raw, snapshot.note.body, manualTags, imagePaths, null);
+        } catch (error) {
+          if (imagePaths.length > 0) await this.storage.discardCreatedImages(imagePaths);
+          console.warn("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF0C\u4F46\u56FE\u7247\u4FDD\u5B58\u5931\u8D25\u3002", error);
+          new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u6B63\u6587\u5DF2\u4FDD\u5B58\uFF0C\u4F46\u56FE\u7247\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u91CD\u65B0\u7F16\u8F91\u6DFB\u52A0\u3002");
+        }
+      }
+      this.rememberManualTags(manualTags);
+      this.revokePendingImages(composerDraft.pendingImages);
+      this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
+      this.renderComposerExtras(tagHost, imageHost);
       textarea.value = "";
       this.resizeNoteInput(textarea);
       this.selectedCategory = null;
@@ -719,12 +959,14 @@ var BianlitieView = class extends import_obsidian6.ItemView {
         item.removeClass("is-active");
         item.setAttribute("aria-pressed", "false");
       }
-      new import_obsidian6.Notice(`\u5DF2\u5B58\u8FDB\u300C${category}\u300D\u4FBF\u5229\u8D34\u3002`);
+      new import_obsidian7.Notice(`\u5DF2\u5B58\u8FDB\u300C${category}\u300D\u4FBF\u5229\u8D34\u3002`);
       await this.runSearch(searchInput.value, resultStatus, resultList);
       if (this.deepseek.isConfigured()) void this.enrichNote(file, originalContent, category);
     } catch (error) {
+      composerDraft.saving = false;
       const message = error instanceof Error ? error.message : "\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
-      new import_obsidian6.Notice(message);
+      new import_obsidian7.Notice(message);
+      this.renderComposerExtras(tagHost, imageHost);
     } finally {
       button.disabled = false;
       button.setText("\u5B58\u8FDB\u4FBF\u5229\u8D34");
@@ -734,10 +976,10 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     try {
       const metadata = await this.deepseek.generateMetadata(originalContent, category);
       await this.storage.updateGeneratedMetadata(file, metadata);
-      new import_obsidian6.Notice("\u4FBF\u5229\u8D34\u5DF2\u8865\u5145\u6807\u7B7E\u4E0E\u68C0\u7D22\u5173\u952E\u8BCD\u3002");
+      new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u5DF2\u8865\u5145\u6807\u7B7E\u4E0E\u68C0\u7D22\u5173\u952E\u8BCD\u3002");
     } catch (error) {
       console.warn("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF0C\u4F46 DeepSeek \u5143\u6570\u636E\u751F\u6210\u5931\u8D25\u3002", error);
-      new import_obsidian6.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF1BAI \u6807\u7B7E\u751F\u6210\u5931\u8D25\uFF0C\u4E0D\u5F71\u54CD\u539F\u6587\u3002");
+      new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF1BAI \u6807\u7B7E\u751F\u6210\u5931\u8D25\uFF0C\u4E0D\u5F71\u54CD\u539F\u6587\u3002");
     }
   }
   async runSearch(query, status, list, showLoading = true) {
@@ -750,8 +992,7 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       this.renderResults(list, records);
     } catch (error) {
       if (sequence !== this.searchSequence) return;
-      const message = error instanceof Error ? error.message : "\u641C\u7D22\u5931\u8D25\u3002";
-      status.setText(message);
+      status.setText(error instanceof Error ? error.message : "\u641C\u7D22\u5931\u8D25\u3002");
       list.empty();
     }
   }
@@ -760,7 +1001,7 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     if (records.length === 0) {
       const empty = container.createDiv({ cls: "bianlitie-empty" });
       const icon = empty.createSpan();
-      (0, import_obsidian6.setIcon)(icon, "inbox");
+      (0, import_obsidian7.setIcon)(icon, "inbox");
       empty.createEl("p", { text: "\u8FD8\u6CA1\u6709\u627E\u5230\u5339\u914D\u7684\u4FBF\u5229\u8D34\u3002" });
       return;
     }
@@ -775,6 +1016,8 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       top.createSpan({ text: record.category, cls: "bianlitie-category-chip" });
       top.createSpan({ text: record.modified || "\u672A\u8BB0\u5F55\u65F6\u95F4", cls: "bianlitie-created" });
       card.createEl("p", { text: record.snippet || "\u6682\u65E0\u5185\u5BB9", cls: "bianlitie-body-preview" });
+      this.renderVisibleManualTags(card, record.manualTags);
+      this.renderCardImages(card, record.images);
       const actions = card.createDiv({ cls: "bianlitie-result-actions" });
       const editButton = actions.createEl("button", {
         text: "\u7F16\u8F91",
@@ -796,13 +1039,30 @@ var BianlitieView = class extends import_obsidian6.ItemView {
         this.requestDelete(record);
       });
       if (isEditing && this.draft) this.renderDraftEditor(card, this.draft);
-      card.addEventListener("click", () => {
-        void this.app.workspace.getLeaf(false).openFile(record.file);
-      });
+      card.addEventListener("click", () => void this.app.workspace.getLeaf(false).openFile(record.file));
       card.addEventListener("keydown", (event) => {
         if (event.target !== card || event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
         void this.app.workspace.getLeaf(false).openFile(record.file);
+      });
+    }
+  }
+  renderVisibleManualTags(card, tags) {
+    if (tags.length === 0) return;
+    const row = card.createDiv({ cls: "bianlitie-card-tags", attr: { "aria-label": "\u624B\u52A8\u6807\u7B7E" } });
+    for (const tag of tags) row.createSpan({ text: `#${tag}`, cls: "bianlitie-card-tag" });
+  }
+  renderCardImages(card, imagePaths) {
+    const available = imagePaths.map((path) => ({ path, source: this.storage.getImageResourcePath(path) })).filter((item) => item.source !== null).slice(0, 3);
+    if (available.length === 0) return;
+    const gallery = card.createDiv({ cls: `bianlitie-card-images bianlitie-card-images--${available.length}` });
+    gallery.addEventListener("click", (event) => event.stopPropagation());
+    for (const item of available) {
+      const button = gallery.createEl("button", { cls: "bianlitie-thumbnail", attr: { type: "button", "aria-label": "\u67E5\u770B\u4FBF\u5229\u8D34\u56FE\u7247" } });
+      button.createEl("img", { attr: { src: item.source, alt: item.path, loading: "lazy" } });
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        new BianlitieImageModal(this.app, item.source, item.path.split("/").pop() ?? "\u4FBF\u5229\u8D34\u56FE\u7247").open();
       });
     }
   }
@@ -819,12 +1079,30 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
     });
+    const tagHost = editor.createDiv();
+    this.renderManualTagEditor(
+      tagHost,
+      () => this.draft?.path === draft.path ? this.draft.manualTags : [],
+      (tags) => {
+        if (this.draft?.path === draft.path) this.draft.manualTags = tags;
+      },
+      () => this.draft?.path !== draft.path || this.draft.saving
+    );
+    const imageHost = editor.createDiv();
+    this.renderImageEditor(
+      imageHost,
+      () => this.draft?.path === draft.path ? this.draft.images : [],
+      (images) => {
+        if (this.draft?.path === draft.path) this.draft.images = images;
+      },
+      () => this.draft?.path === draft.path ? this.draft.pendingImages : [],
+      (images) => {
+        if (this.draft?.path === draft.path) this.draft.pendingImages = images;
+      },
+      () => this.draft?.path !== draft.path || this.draft.saving
+    );
     const controls = editor.createDiv({ cls: "bianlitie-draft-actions" });
-    const cancelButton = controls.createEl("button", {
-      text: "\u53D6\u6D88",
-      cls: "bianlitie-draft-cancel",
-      attr: { type: "button" }
-    });
+    const cancelButton = controls.createEl("button", { text: "\u53D6\u6D88", cls: "bianlitie-draft-cancel", attr: { type: "button" } });
     const saveButton = controls.createEl("button", {
       text: draft.saving ? "\u4FDD\u5B58\u4E2D\u2026" : "\u4FDD\u5B58",
       cls: "bianlitie-draft-save",
@@ -833,22 +1111,164 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     cancelButton.disabled = draft.saving;
     saveButton.disabled = draft.saving;
     cancelButton.addEventListener("click", () => this.cancelDraft(draft.path));
-    saveButton.addEventListener("click", () => {
-      void this.saveDraft(draft.path);
-    });
+    saveButton.addEventListener("click", () => void this.saveDraft(draft.path));
+  }
+  renderManualTagEditor(holder, getTags, setTags, isDisabled) {
+    let expanded = false;
+    const render = () => {
+      holder.empty();
+      holder.addClass("bianlitie-tag-editor");
+      holder.toggleClass("is-disabled", isDisabled());
+      const row = holder.createDiv({ cls: "bianlitie-tag-row" });
+      for (const tag of getTags()) {
+        const chip = row.createSpan({ cls: "bianlitie-manual-tag" });
+        chip.createSpan({ text: `#${tag}` });
+        const remove = chip.createEl("button", { attr: { type: "button", "aria-label": `\u5220\u9664\u6807\u7B7E ${tag}` } });
+        (0, import_obsidian7.setIcon)(remove, "x");
+        remove.disabled = isDisabled();
+        remove.addEventListener("click", () => {
+          if (isDisabled()) return;
+          setTags(getTags().filter((item) => item !== tag));
+          render();
+        });
+      }
+      const addButton = row.createEl("button", {
+        text: "# \u6DFB\u52A0\u6807\u7B7E",
+        cls: "bianlitie-add-tag",
+        attr: { type: "button", "aria-expanded": String(expanded) }
+      });
+      addButton.disabled = isDisabled();
+      addButton.addEventListener("click", () => {
+        if (isDisabled()) return;
+        expanded = !expanded;
+        render();
+        if (expanded) window.setTimeout(() => holder.querySelector(".bianlitie-tag-input")?.focus(), 0);
+      });
+      if (!expanded) return;
+      const panel = holder.createDiv({ cls: "bianlitie-tag-panel" });
+      const inputRow = panel.createDiv({ cls: "bianlitie-tag-input-row" });
+      const input = inputRow.createEl("input", {
+        type: "text",
+        cls: "bianlitie-tag-input",
+        attr: { placeholder: "\u8F93\u5165\u6807\u7B7E\u540D\u79F0", "aria-label": "\u65B0\u624B\u52A8\u6807\u7B7E" }
+      });
+      const confirm = inputRow.createEl("button", { text: "\u6DFB\u52A0", attr: { type: "button" } });
+      const addValue = () => {
+        const tag = normalizeManualTag(input.value);
+        if (!tag) return;
+        const tags = normalizeManualTags([...getTags(), tag]);
+        if (tags.length === getTags().length) {
+          input.value = "";
+          return;
+        }
+        setTags(tags);
+        input.value = "";
+        render();
+      };
+      confirm.addEventListener("click", addValue);
+      input.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        addValue();
+      });
+      const history = normalizeManualTags(this.getManualTagHistory(), 50).filter((tag) => !getTags().includes(tag));
+      if (history.length > 0) {
+        panel.createDiv({ text: "\u5386\u53F2\u6807\u7B7E", cls: "bianlitie-tag-history-label" });
+        const historyRow = panel.createDiv({ cls: "bianlitie-tag-history" });
+        for (const tag of history) {
+          const button = historyRow.createEl("button", { text: `#${tag}`, attr: { type: "button" } });
+          button.addEventListener("click", () => {
+            setTags(normalizeManualTags([...getTags(), tag]));
+            render();
+          });
+        }
+      }
+    };
+    render();
+  }
+  renderImageEditor(holder, getExisting, setExisting, getPending, setPending, isDisabled) {
+    const render = () => {
+      holder.empty();
+      holder.addClass("bianlitie-image-editor");
+      const existing = getExisting();
+      const pending = getPending();
+      const gallery = holder.createDiv({ cls: "bianlitie-edit-images" });
+      for (const path of existing) {
+        const source = this.storage.getImageResourcePath(path);
+        this.renderEditableImage(gallery, source, path.split("/").pop() ?? "\u4FBF\u5229\u8D34\u56FE\u7247", () => {
+          if (isDisabled()) return;
+          setExisting(getExisting().filter((item) => item !== path));
+          render();
+        });
+      }
+      for (const image of pending) {
+        this.renderEditableImage(gallery, image.previewUrl, image.file.name, () => {
+          if (isDisabled()) return;
+          URL.revokeObjectURL(image.previewUrl);
+          setPending(getPending().filter((item) => item.id !== image.id));
+          render();
+        });
+      }
+      const input = holder.createEl("input", {
+        type: "file",
+        cls: "bianlitie-image-input",
+        attr: { accept: "image/*", multiple: "", "aria-label": "\u9009\u62E9\u4FBF\u5229\u8D34\u56FE\u7247" }
+      });
+      const addButton = holder.createEl("button", {
+        cls: "bianlitie-add-image",
+        attr: { type: "button" }
+      });
+      const icon = addButton.createSpan();
+      (0, import_obsidian7.setIcon)(icon, "image-plus");
+      addButton.createSpan({ text: `\u6DFB\u52A0\u56FE\u7247 ${existing.length + pending.length}/${MAX_IMAGES_PER_NOTE}` });
+      addButton.disabled = isDisabled() || existing.length + pending.length >= MAX_IMAGES_PER_NOTE;
+      addButton.addEventListener("click", () => {
+        if (!addButton.disabled) input.click();
+      });
+      input.addEventListener("change", () => {
+        if (isDisabled()) return;
+        const available = MAX_IMAGES_PER_NOTE - getExisting().length - getPending().length;
+        const selected = Array.from(input.files ?? []).filter((file) => this.isImageFile(file));
+        if (selected.length > available) new import_obsidian7.Notice(`\u6BCF\u6761\u4FBF\u5229\u8D34\u6700\u591A\u6DFB\u52A0 ${MAX_IMAGES_PER_NOTE} \u5F20\u56FE\u7247\u3002`);
+        const next = selected.slice(0, Math.max(0, available)).map((file) => ({
+          id: `${Date.now()}-${this.pendingImageSequence += 1}`,
+          file,
+          previewUrl: URL.createObjectURL(file)
+        }));
+        setPending([...getPending(), ...next]);
+        input.value = "";
+        render();
+      });
+    };
+    render();
+  }
+  renderEditableImage(gallery, source, label, onRemove) {
+    const item = gallery.createDiv({ cls: "bianlitie-edit-image" });
+    const preview = item.createEl("button", { cls: "bianlitie-edit-image__preview", attr: { type: "button", "aria-label": `\u67E5\u770B ${label}` } });
+    if (source) {
+      preview.createEl("img", { attr: { src: source, alt: label } });
+      preview.addEventListener("click", () => new BianlitieImageModal(this.app, source, label).open());
+    } else {
+      preview.createSpan({ text: "\u56FE\u7247\u5DF2\u79FB\u52A8", cls: "bianlitie-image-missing" });
+      preview.disabled = true;
+    }
+    const remove = item.createEl("button", { cls: "bianlitie-edit-image__remove", attr: { type: "button", "aria-label": `\u79FB\u9664 ${label}` } });
+    (0, import_obsidian7.setIcon)(remove, "x");
+    remove.addEventListener("click", onRemove);
   }
   async beginEdit(record) {
     if (this.draft?.path === record.file.path) {
       this.focusDraftEditor();
       return;
     }
-    if (this.draft && this.draft.body !== this.draft.baseBody) {
-      new import_obsidian6.Notice("\u8BF7\u5148\u4FDD\u5B58\u6216\u53D6\u6D88\u5F53\u524D\u8349\u7A3F\uFF0C\u518D\u7F16\u8F91\u53E6\u4E00\u6761\u4FBF\u5229\u8D34\u3002");
+    if (this.draft && this.isDraftDirty(this.draft)) {
+      new import_obsidian7.Notice("\u8BF7\u5148\u4FDD\u5B58\u6216\u53D6\u6D88\u5F53\u524D\u8349\u7A3F\uFF0C\u518D\u7F16\u8F91\u53E6\u4E00\u6761\u4FBF\u5229\u8D34\u3002");
       return;
     }
+    if (this.draft) this.revokePendingImages(this.draft.pendingImages);
     const current = this.app.vault.getAbstractFileByPath(record.file.path);
-    if (!(current instanceof import_obsidian6.TFile) || !this.storage.isManagedFile(current)) {
-      new import_obsidian6.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
+    if (!(current instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(current)) {
+      new import_obsidian7.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
       return;
     }
     try {
@@ -857,6 +1277,11 @@ var BianlitieView = class extends import_obsidian6.ItemView {
         path: current.path,
         body: snapshot.note.body,
         baseBody: snapshot.note.body,
+        manualTags: [...snapshot.note.manualTags],
+        baseManualTags: [...snapshot.note.manualTags],
+        images: [...snapshot.note.images],
+        baseImages: [...snapshot.note.images],
+        pendingImages: [],
         baseRaw: snapshot.raw,
         baseMtime: snapshot.mtime,
         saving: false
@@ -864,12 +1289,12 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       await this.refreshResults(false);
       this.focusDraftEditor();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "\u65E0\u6CD5\u8BFB\u53D6\u4FBF\u5229\u8D34\u6B63\u6587\u3002";
-      new import_obsidian6.Notice(message);
+      new import_obsidian7.Notice(error instanceof Error ? error.message : "\u65E0\u6CD5\u8BFB\u53D6\u4FBF\u5229\u8D34\u6B63\u6587\u3002");
     }
   }
   cancelDraft(path) {
     if (this.draft?.path !== path || this.draft.saving) return;
+    this.revokePendingImages(this.draft.pendingImages);
     this.draft = null;
     void this.refreshResults(false);
   }
@@ -877,51 +1302,68 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     const draft = this.draft;
     if (!draft || draft.path !== path || draft.saving) return;
     const current = this.app.vault.getAbstractFileByPath(path);
-    if (!(current instanceof import_obsidian6.TFile) || !this.storage.isManagedFile(current)) {
+    if (!(current instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(current)) {
       this.showConflict(path);
       return;
     }
+    let createdImagePaths = [];
+    let noteUpdated = false;
     try {
       const snapshot = await this.storage.readNoteSnapshot(current);
       if (snapshot.raw !== draft.baseRaw || snapshot.mtime !== draft.baseMtime) {
         this.showConflict(path);
         return;
       }
-      if (draft.body === snapshot.note.body) {
+      const bodyChanged = draft.body !== snapshot.note.body;
+      const tagsChanged = !this.sameStringArray(draft.manualTags, snapshot.note.manualTags);
+      const imagesChanged = !this.sameStringArray(draft.images, snapshot.note.images) || draft.pendingImages.length > 0;
+      if (!bodyChanged && !tagsChanged && !imagesChanged) {
+        this.revokePendingImages(draft.pendingImages);
         this.draft = null;
         await this.refreshResults(false);
         return;
       }
       draft.saving = true;
       await this.refreshResults(false);
-      await this.storage.updateNoteBody(current, snapshot.raw, draft.body, /* @__PURE__ */ new Date());
-      if (this.deepseek.isConfigured() && draft.body.trim()) {
+      if (draft.pendingImages.length > 0) {
+        createdImagePaths = await this.storage.saveImages(await this.toImageUploads(draft.pendingImages));
+      }
+      const finalImages = [...draft.images, ...createdImagePaths].slice(0, MAX_IMAGES_PER_NOTE);
+      await this.storage.updateNote(
+        current,
+        snapshot.raw,
+        draft.body,
+        draft.manualTags,
+        finalImages,
+        bodyChanged ? /* @__PURE__ */ new Date() : null
+      );
+      noteUpdated = true;
+      this.rememberManualTags(draft.manualTags);
+      if (bodyChanged && this.deepseek.isConfigured() && draft.body.trim()) {
         try {
           const metadata = await this.deepseek.generateMetadata(draft.body, snapshot.note.category);
           const latestFile = this.app.vault.getAbstractFileByPath(path);
-          if (!(latestFile instanceof import_obsidian6.TFile) || !this.storage.isManagedFile(latestFile)) {
+          if (!(latestFile instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(latestFile)) {
             throw new Error("\u4FBF\u5229\u8D34\u5728\u751F\u6210\u6807\u7B7E\u671F\u95F4\u5DF2\u88AB\u79FB\u52A8\u6216\u5220\u9664\u3002");
           }
           const latest = await this.storage.readNote(latestFile);
-          if (latest.body !== draft.body) {
-            throw new Error("\u6B63\u6587\u5728\u751F\u6210\u6807\u7B7E\u671F\u95F4\u53D1\u751F\u4E86\u53D8\u5316\u3002");
-          }
+          if (latest.body !== draft.body) throw new Error("\u6B63\u6587\u5728\u751F\u6210\u6807\u7B7E\u671F\u95F4\u53D1\u751F\u4E86\u53D8\u5316\u3002");
           await this.storage.updateGeneratedMetadata(latestFile, metadata);
         } catch (error) {
           console.warn("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF0C\u4F46 DeepSeek \u5143\u6570\u636E\u751F\u6210\u5931\u8D25\u3002", error);
-          new import_obsidian6.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF1BAI \u6807\u7B7E\u751F\u6210\u5931\u8D25\uFF0C\u4E0D\u5F71\u54CD\u539F\u6587\u3002");
+          new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\uFF1BAI \u6807\u7B7E\u751F\u6210\u5931\u8D25\uFF0C\u4E0D\u5F71\u54CD\u539F\u6587\u3002");
         }
       }
+      this.revokePendingImages(draft.pendingImages);
       this.draft = null;
-      new import_obsidian6.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\u3002");
+      new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u5DF2\u4FDD\u5B58\u3002");
       await this.refreshResults(false);
     } catch (error) {
+      if (!noteUpdated && createdImagePaths.length > 0) await this.storage.discardCreatedImages(createdImagePaths);
       if (this.draft?.path === path) this.draft.saving = false;
-      if (error instanceof NoteConflictError) {
-        this.showConflict(path);
-      } else {
-        const message = error instanceof Error ? error.message : "\u4FBF\u5229\u8D34\u4FDD\u5B58\u5931\u8D25\u3002";
-        new import_obsidian6.Notice(message);
+      if (error instanceof NoteConflictError) this.showConflict(path);
+      else {
+        new import_obsidian7.Notice(error instanceof Error ? error.message : "\u4FBF\u5229\u8D34\u4FDD\u5B58\u5931\u8D25\u3002");
         await this.refreshResults(false);
       }
     }
@@ -931,25 +1373,30 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       title: "\u4FBF\u5229\u8D34\u5DF2\u53D1\u751F\u53D8\u5316",
       message: "\u8FD9\u6761\u4FBF\u5229\u8D34\u5728\u7F16\u8F91\u671F\u95F4\u5DF2\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u8F7D\u5165\u540E\u518D\u7F16\u8F91\u3002",
       confirmLabel: "\u91CD\u65B0\u8F7D\u5165",
-      onConfirm: async () => {
-        await this.reloadDraft(path);
-      }
+      onConfirm: async () => this.reloadDraft(path)
     }).open();
   }
   async reloadDraft(path) {
     const current = this.app.vault.getAbstractFileByPath(path);
-    if (!(current instanceof import_obsidian6.TFile) || !this.storage.isManagedFile(current)) {
+    if (!(current instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(current)) {
+      if (this.draft) this.revokePendingImages(this.draft.pendingImages);
       this.draft = null;
-      new import_obsidian6.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
+      new import_obsidian7.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
       await this.refreshResults(false);
       return;
     }
     try {
       const snapshot = await this.storage.readNoteSnapshot(current);
+      if (this.draft) this.revokePendingImages(this.draft.pendingImages);
       this.draft = {
         path: current.path,
         body: snapshot.note.body,
         baseBody: snapshot.note.body,
+        manualTags: [...snapshot.note.manualTags],
+        baseManualTags: [...snapshot.note.manualTags],
+        images: [...snapshot.note.images],
+        baseImages: [...snapshot.note.images],
+        pendingImages: [],
         baseRaw: snapshot.raw,
         baseMtime: snapshot.mtime,
         saving: false
@@ -957,37 +1404,56 @@ var BianlitieView = class extends import_obsidian6.ItemView {
       await this.refreshResults(false);
       this.focusDraftEditor();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "\u91CD\u65B0\u8F7D\u5165\u4FBF\u5229\u8D34\u5931\u8D25\u3002";
-      new import_obsidian6.Notice(message);
+      new import_obsidian7.Notice(error instanceof Error ? error.message : "\u91CD\u65B0\u8F7D\u5165\u4FBF\u5229\u8D34\u5931\u8D25\u3002");
     }
   }
   requestDelete(record) {
     new BianlitieActionModal(this.app, {
       title: "\u5220\u9664\u4FBF\u5229\u8D34",
-      message: "\u786E\u5B9A\u5220\u9664\u8FD9\u6761\u4FBF\u5229\u8D34\u5417\uFF1F\u5220\u9664\u540E\u5C06\u79FB\u9664\u5BF9\u5E94 Markdown \u6587\u4EF6\u3002",
+      message: "\u786E\u5B9A\u5220\u9664\u8FD9\u6761\u4FBF\u5229\u8D34\u5417\uFF1F\u5BF9\u5E94 Markdown \u6587\u4EF6\u5C06\u79FB\u5165\u56DE\u6536\u7AD9\uFF1B\u9644\u4EF6\u4F1A\u4FDD\u7559\u4EE5\u907F\u514D\u8BEF\u5220\u3002",
       confirmLabel: "\u5220\u9664",
       danger: true,
-      onConfirm: async () => {
-        await this.deleteNote(record.file.path);
-      }
+      onConfirm: async () => this.deleteNote(record.file.path)
     }).open();
   }
   async deleteNote(path) {
     const current = this.app.vault.getAbstractFileByPath(path);
-    if (!(current instanceof import_obsidian6.TFile) || !this.storage.isManagedFile(current)) {
-      new import_obsidian6.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
+    if (!(current instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(current)) {
+      new import_obsidian7.Notice("\u8FD9\u6761\u4FBF\u5229\u8D34\u5DF2\u4E0D\u5B58\u5728\u6216\u5DF2\u88AB\u79FB\u52A8\u3002");
       await this.refreshResults(false);
       return;
     }
     try {
       await this.storage.trashNote(current);
-      if (this.draft?.path === path) this.draft = null;
-      new import_obsidian6.Notice("\u4FBF\u5229\u8D34\u5DF2\u79FB\u5165\u56DE\u6536\u7AD9\u3002");
+      if (this.draft?.path === path) {
+        this.revokePendingImages(this.draft.pendingImages);
+        this.draft = null;
+      }
+      new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u5DF2\u79FB\u5165\u56DE\u6536\u7AD9\uFF1B\u9644\u4EF6\u5DF2\u4FDD\u7559\u3002");
       await this.refreshResults(false);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "\u5220\u9664\u4FBF\u5229\u8D34\u5931\u8D25\u3002";
-      new import_obsidian6.Notice(message);
+      new import_obsidian7.Notice(error instanceof Error ? error.message : "\u5220\u9664\u4FBF\u5229\u8D34\u5931\u8D25\u3002");
     }
+  }
+  isDraftDirty(draft) {
+    return draft.body !== draft.baseBody || !this.sameStringArray(draft.manualTags, draft.baseManualTags) || !this.sameStringArray(draft.images, draft.baseImages) || draft.pendingImages.length > 0;
+  }
+  sameStringArray(left, right) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+  async toImageUploads(images) {
+    return Promise.all(images.map(async (image) => ({
+      name: image.file.name,
+      mimeType: image.file.type,
+      data: await image.file.arrayBuffer()
+    })));
+  }
+  isImageFile(file) {
+    if (file.type.startsWith("image/")) return true;
+    return /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/iu.test(file.name);
+  }
+  revokePendingImages(images) {
+    for (const image of images) URL.revokeObjectURL(image.previewUrl);
   }
   async refreshResults(showLoading) {
     const ui = this.searchUi;
@@ -999,13 +1465,14 @@ var BianlitieView = class extends import_obsidian6.ItemView {
     });
   }
   focusDraftEditor() {
-    window.requestAnimationFrame(() => {
-      this.searchUi?.list.querySelector(".bianlitie-draft-input")?.focus();
-    });
+    window.requestAnimationFrame(() => this.searchUi?.list.querySelector(".bianlitie-draft-input")?.focus());
   }
   async onClose() {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
+    if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
+    if (this.draft) this.revokePendingImages(this.draft.pendingImages);
+    this.composerDraft = null;
     this.draft = null;
     this.searchUi = null;
   }
@@ -1014,9 +1481,10 @@ var BianlitieView = class extends import_obsidian6.ItemView {
 // src/main.ts
 var DEFAULT_SETTINGS = {
   deepseekApiKey: "",
-  deepseekModel: DEFAULT_MODEL
+  deepseekModel: DEFAULT_MODEL,
+  manualTagHistory: []
 };
-var BianlitiePlugin = class extends import_obsidian7.Plugin {
+var BianlitiePlugin = class extends import_obsidian8.Plugin {
   constructor() {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
@@ -1027,7 +1495,13 @@ var BianlitiePlugin = class extends import_obsidian7.Plugin {
     this.deepseek = new DeepSeekClient(() => this.settings);
     this.registerView(
       VIEW_TYPE_BIANLITIE,
-      (leaf) => new BianlitieView(leaf, this.storage, this.deepseek)
+      (leaf) => new BianlitieView(
+        leaf,
+        this.storage,
+        this.deepseek,
+        () => this.settings.manualTagHistory,
+        (tags) => this.rememberManualTags(tags)
+      )
     );
     this.addRibbonIcon("sticky-note", "\u6253\u5F00\u4FBF\u5229\u8D34", () => {
       void this.activateView();
@@ -1047,11 +1521,17 @@ var BianlitiePlugin = class extends import_obsidian7.Plugin {
       }
     });
     this.addSettingTab(new BianlitieSettingTab(this.app, this));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (!(file instanceof import_obsidian8.TFile) || !this.storage.isManagedAttachmentPath(oldPath) && !this.storage.isImagePath(oldPath)) return;
+      void this.storage.updateImagePath(oldPath, file.path).catch((error) => {
+        console.warn("\u4FBF\u5229\u8D34\u9644\u4EF6\u8DEF\u5F84\u66F4\u65B0\u5931\u8D25\u3002", error);
+      });
+    }));
     try {
       await this.storage.ensureFolders();
     } catch (error) {
       const message = error instanceof Error ? error.message : "\u65E0\u6CD5\u521B\u5EFA\u4FBF\u5229\u8D34\u5206\u7C7B\u6587\u4EF6\u5939\u3002";
-      new import_obsidian7.Notice(`\u4FBF\u5229\u8D34\uFF1A${message}`);
+      new import_obsidian8.Notice(`\u4FBF\u5229\u8D34\uFF1A${message}`);
     }
   }
   onunload() {
@@ -1059,33 +1539,33 @@ var BianlitiePlugin = class extends import_obsidian7.Plugin {
   }
   async regenerateCurrentNoteMetadata() {
     const file = this.app.workspace.getActiveFile();
-    if (!(file instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(file)) {
-      new import_obsidian7.Notice("\u8BF7\u5148\u6253\u5F00\u4E00\u6761\u4FBF\u5229\u8D34 Markdown \u6587\u4EF6\u3002");
+    if (!(file instanceof import_obsidian8.TFile) || !this.storage.isManagedFile(file)) {
+      new import_obsidian8.Notice("\u8BF7\u5148\u6253\u5F00\u4E00\u6761\u4FBF\u5229\u8D34 Markdown \u6587\u4EF6\u3002");
       return;
     }
     try {
       const note = await this.storage.readNote(file);
       if (!note.body.trim()) {
-        new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u6B63\u6587\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u751F\u6210\u6807\u7B7E\u3002");
+        new import_obsidian8.Notice("\u4FBF\u5229\u8D34\u6B63\u6587\u4E3A\u7A7A\uFF0C\u65E0\u6CD5\u751F\u6210\u6807\u7B7E\u3002");
         return;
       }
       if (!this.deepseek.isConfigured()) {
-        new import_obsidian7.Notice("\u8BF7\u5148\u5728\u4FBF\u5229\u8D34\u8BBE\u7F6E\u4E2D\u586B\u5199 DeepSeek API Key \u548C\u6A21\u578B\u540D\u79F0\u3002");
+        new import_obsidian8.Notice("\u8BF7\u5148\u5728\u4FBF\u5229\u8D34\u8BBE\u7F6E\u4E2D\u586B\u5199 DeepSeek API Key \u548C\u6A21\u578B\u540D\u79F0\u3002");
         return;
       }
       const metadata = await this.deepseek.generateMetadata(note.body, note.category);
       const current = this.app.vault.getAbstractFileByPath(file.path);
-      if (!(current instanceof import_obsidian7.TFile) || !this.storage.isManagedFile(current)) return;
+      if (!(current instanceof import_obsidian8.TFile) || !this.storage.isManagedFile(current)) return;
       const latest = await this.storage.readNote(current);
       if (latest.body !== note.body) {
-        new import_obsidian7.Notice("\u6B63\u6587\u5728\u751F\u6210\u6807\u7B7E\u671F\u95F4\u53D1\u751F\u4E86\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5\u3002");
+        new import_obsidian8.Notice("\u6B63\u6587\u5728\u751F\u6210\u6807\u7B7E\u671F\u95F4\u53D1\u751F\u4E86\u53D8\u5316\uFF0C\u8BF7\u91CD\u8BD5\u3002");
         return;
       }
       await this.storage.updateGeneratedMetadata(current, metadata);
-      new import_obsidian7.Notice("\u4FBF\u5229\u8D34\u6807\u7B7E\u5DF2\u91CD\u65B0\u751F\u6210");
+      new import_obsidian8.Notice("\u4FBF\u5229\u8D34\u6807\u7B7E\u5DF2\u91CD\u65B0\u751F\u6210");
     } catch (error) {
       const message = error instanceof Error ? error.message : "\u6807\u7B7E\u751F\u6210\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
-      new import_obsidian7.Notice(message);
+      new import_obsidian8.Notice(message);
     }
   }
   async activateView() {
@@ -1101,8 +1581,15 @@ var BianlitiePlugin = class extends import_obsidian7.Plugin {
   async loadSettings() {
     const saved = await this.loadData();
     this.settings = { ...DEFAULT_SETTINGS, ...saved ?? {} };
+    this.settings.manualTagHistory = normalizeManualTags(this.settings.manualTagHistory, 50);
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  rememberManualTags(tags) {
+    const next = normalizeManualTags([...this.settings.manualTagHistory, ...tags], 50);
+    if (next.length === this.settings.manualTagHistory.length && next.every((tag, index) => tag === this.settings.manualTagHistory[index])) return;
+    this.settings.manualTagHistory = next;
+    void this.saveSettings().catch((error) => console.warn("\u4FBF\u5229\u8D34\u5386\u53F2\u6807\u7B7E\u4FDD\u5B58\u5931\u8D25\u3002", error));
   }
 };

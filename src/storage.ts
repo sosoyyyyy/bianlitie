@@ -1,13 +1,24 @@
 import { App, normalizePath, TFile, TFolder } from "obsidian";
-import { CATEGORIES, ROOT_FOLDER, type Category, type CategoryFilter } from "./constants";
+import {
+  ATTACHMENT_ROOT,
+  CATEGORIES,
+  MAX_IMAGES_PER_NOTE,
+  ROOT_FOLDER,
+  type Category,
+  type CategoryFilter
+} from "./constants";
 import type { GeneratedMetadata, StickyNoteRecord } from "./types";
 import {
   extractSearchTerms,
   formatCreated,
   formatFileTimestamp,
   makeSnippet,
+  normalizeImagePaths,
   normalizeList,
+  normalizeManualTags,
+  pad,
   parseCreated,
+  sanitizeAttachmentFileName,
   stripFrontmatter
 } from "./utils";
 
@@ -17,7 +28,15 @@ export interface ParsedNote {
   updated: string;
   tags: string[];
   keywords: string[];
+  manualTags: string[];
+  images: string[];
   body: string;
+}
+
+export interface ImageUpload {
+  name: string;
+  mimeType: string;
+  data: ArrayBuffer;
 }
 
 export interface NoteSnapshot {
@@ -50,7 +69,7 @@ export class StickyNoteStorage {
     await this.app.vault.createFolder(path);
   }
 
-  async createNote(category: Category, originalContent: string): Promise<TFile> {
+  async createNote(category: Category, originalContent: string, manualTags: string[] = []): Promise<TFile> {
     await this.ensureFolders();
     const now = new Date();
     const folder = normalizePath(`${ROOT_FOLDER}/${category}`);
@@ -63,6 +82,8 @@ export class StickyNoteStorage {
       `updated: ${formatCreated(now)}`,
       "tags: []",
       "keywords: []",
+      `manualTags: ${JSON.stringify(normalizeManualTags(manualTags))}`,
+      "images: []",
       "---",
       ""
     ].join("\n");
@@ -89,6 +110,51 @@ export class StickyNoteStorage {
     });
   }
 
+  async saveImages(uploads: ImageUpload[], savedAt = new Date()): Promise<string[]> {
+    if (uploads.length > MAX_IMAGES_PER_NOTE) throw new Error(`每条便利贴最多添加 ${MAX_IMAGES_PER_NOTE} 张图片。`);
+    const folder = normalizePath(`${ATTACHMENT_ROOT}/${savedAt.getFullYear()}/${pad(savedAt.getMonth() + 1)}`);
+    await this.ensureFolderTree(folder);
+    const created: TFile[] = [];
+    try {
+      for (const upload of uploads) {
+        const fileName = this.ensureImageExtension(sanitizeAttachmentFileName(upload.name), upload.mimeType);
+        const path = this.uniqueAttachmentPath(folder, fileName);
+        created.push(await this.app.vault.createBinary(path, upload.data));
+      }
+      return created.map((file) => file.path);
+    } catch (error) {
+      for (const file of created) {
+        try {
+          await this.app.vault.trash(file, false);
+        } catch {
+          // 仅回收本次刚创建的附件；回收失败时保留文件，避免进一步的数据风险。
+        }
+      }
+      throw error;
+    }
+  }
+
+  async discardCreatedImages(paths: string[]): Promise<void> {
+    for (const path of normalizeImagePaths(paths, MAX_IMAGES_PER_NOTE)) {
+      if (!this.isManagedAttachmentPath(path)) continue;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      try {
+        await this.app.vault.trash(file, false);
+      } catch (error) {
+        console.warn("无法回收未绑定的便利贴附件。", error);
+      }
+    }
+  }
+
+  getImageResourcePath(path: string): string | null {
+    const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
+    if (!(file instanceof TFile)) return null;
+    const resource = this.app.vault.getResourcePath(file);
+    const separator = resource.includes("?") ? "&" : "?";
+    return `${resource}${separator}bianlitieMtime=${file.stat.mtime}`;
+  }
+
   async readNote(file: TFile): Promise<ParsedNote> {
     if (!this.isManagedFile(file)) throw new Error("这不是便利贴目录中的 Markdown 文件。");
     const raw = await this.app.vault.read(file);
@@ -105,12 +171,32 @@ export class StickyNoteStorage {
     };
   }
 
-  async updateNoteBody(file: TFile, expectedRaw: string, body: string, updatedAt: Date): Promise<void> {
+  async updateNote(
+    file: TFile,
+    expectedRaw: string,
+    body: string,
+    manualTags: string[],
+    images: string[],
+    updatedAt: Date | null
+  ): Promise<void> {
     if (!this.isManagedFile(file)) throw new Error("拒绝修改便利贴目录之外的文件。");
     await this.app.vault.process(file, (currentRaw) => {
       if (currentRaw !== expectedRaw) throw new NoteConflictError();
-      return this.replaceBodyAndUpdated(currentRaw, body, updatedAt);
+      return this.replaceBodyAndUserMetadata(currentRaw, body, manualTags, images, updatedAt);
     });
+  }
+
+  async updateImagePath(oldPath: string, newPath: string): Promise<void> {
+    const normalizedOld = normalizePath(oldPath);
+    const normalizedNew = normalizePath(newPath);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => this.isManagedFile(file));
+    for (const file of files) {
+      const note = await this.readNote(file);
+      if (!note.images.includes(normalizedOld)) continue;
+      await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+        frontmatter.images = normalizeImagePaths(note.images.map((path) => path === normalizedOld ? normalizedNew : path));
+      });
+    }
   }
 
   async trashNote(file: TFile): Promise<void> {
@@ -153,23 +239,36 @@ export class StickyNoteStorage {
       && CATEGORIES.some((category) => file.path.startsWith(`${ROOT_FOLDER}/${category}/`));
   }
 
+  isManagedAttachmentPath(path: string): boolean {
+    const normalized = normalizePath(path);
+    return normalized === ATTACHMENT_ROOT || normalized.startsWith(`${ATTACHMENT_ROOT}/`);
+  }
+
+  isImagePath(path: string): boolean {
+    return /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/iu.test(path);
+  }
+
   private toRecord(file: TFile, parsed: ParsedNote, query: string, terms: string[]): StickyNoteRecord {
     const title = makeSnippet(parsed.body, 80) || "暂无内容";
     const modifiedTimestamp = parseCreated(parsed.updated) || file.stat.mtime;
     const titleText = `${file.basename} ${title}`.toLocaleLowerCase();
     const tagText = parsed.tags.join(" ").toLocaleLowerCase();
+    const manualTagText = parsed.manualTags.join(" ").toLocaleLowerCase();
     const keywordText = parsed.keywords.join(" ").toLocaleLowerCase();
     const bodyText = parsed.body.toLocaleLowerCase();
+    const categoryText = parsed.category.toLocaleLowerCase();
     let score = 0;
 
     for (const term of terms) {
       if (titleText.includes(term)) score += 10;
+      if (manualTagText.includes(term)) score += 11;
       if (tagText.includes(term)) score += 9;
       if (keywordText.includes(term)) score += 8;
+      if (categoryText.includes(term)) score += 7;
       if (bodyText.includes(term)) score += 3;
     }
     const exact = query.toLocaleLowerCase().trim();
-    if (exact && `${titleText} ${tagText} ${keywordText} ${bodyText}`.includes(exact)) score += 12;
+    if (exact && `${titleText} ${manualTagText} ${tagText} ${keywordText} ${categoryText} ${bodyText}`.includes(exact)) score += 12;
 
     return {
       file,
@@ -180,6 +279,8 @@ export class StickyNoteStorage {
       modifiedTimestamp,
       tags: parsed.tags,
       keywords: parsed.keywords,
+      manualTags: parsed.manualTags,
+      images: parsed.images,
       body: parsed.body,
       snippet: makeSnippet(parsed.body),
       score
@@ -194,6 +295,8 @@ export class StickyNoteStorage {
     const updated = this.readScalar(raw, "updated");
     const tags = normalizeList(this.readList(raw, "tags"));
     const keywords = normalizeList(this.readList(raw, "keywords"));
+    const manualTags = normalizeManualTags(this.readList(raw, "manualTags"));
+    const images = normalizeImagePaths(this.readList(raw, "images"), MAX_IMAGES_PER_NOTE);
 
     return {
       category,
@@ -201,21 +304,92 @@ export class StickyNoteStorage {
       updated,
       tags,
       keywords,
+      manualTags,
+      images,
       body: stripFrontmatter(raw)
     };
   }
 
-  private replaceBodyAndUpdated(raw: string, body: string, updatedAt: Date): string {
+  private replaceBodyAndUserMetadata(
+    raw: string,
+    body: string,
+    manualTags: string[],
+    images: string[],
+    updatedAt: Date | null
+  ): string {
     const match = raw.match(/^---(\r?\n)([\s\S]*?)(\r?\n)---(?:\r?\n)?/u);
     if (!match) throw new Error("便利贴缺少可识别的 YAML frontmatter，已停止保存以避免损坏文件。");
 
     const newline = match[1] ?? "\n";
-    const frontmatter = match[2] ?? "";
-    const updatedLine = `updated: ${formatCreated(updatedAt)}`;
-    const nextFrontmatter = /^updated:\s*.*$/mu.test(frontmatter)
-      ? frontmatter.replace(/^updated:\s*.*$/mu, updatedLine)
-      : `${frontmatter}${frontmatter ? newline : ""}${updatedLine}`;
+    let nextFrontmatter = match[2] ?? "";
+    nextFrontmatter = this.replaceFrontmatterField(
+      nextFrontmatter,
+      "manualTags",
+      JSON.stringify(normalizeManualTags(manualTags)),
+      newline
+    );
+    nextFrontmatter = this.replaceFrontmatterField(
+      nextFrontmatter,
+      "images",
+      JSON.stringify(normalizeImagePaths(images, MAX_IMAGES_PER_NOTE)),
+      newline
+    );
+    if (updatedAt) {
+      nextFrontmatter = this.replaceFrontmatterField(nextFrontmatter, "updated", formatCreated(updatedAt), newline);
+    }
     return `---${newline}${nextFrontmatter}${newline}---${newline}${body}`;
+  }
+
+  private replaceFrontmatterField(frontmatter: string, field: string, value: string, newline: string): string {
+    const lines = frontmatter.split(/\r?\n/u);
+    const start = lines.findIndex((line) => new RegExp(`^${field}:`, "u").test(line));
+    const replacement = `${field}: ${value}`;
+    if (start < 0) return `${frontmatter}${frontmatter ? newline : ""}${replacement}`;
+
+    let end = start + 1;
+    while (end < lines.length && /^\s+/u.test(lines[end] ?? "")) end += 1;
+    lines.splice(start, end - start, replacement);
+    return lines.join(newline);
+  }
+
+  private async ensureFolderTree(path: string): Promise<void> {
+    const segments = normalizePath(path).split("/").filter(Boolean);
+    let current = "";
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      await this.ensureFolder(current);
+    }
+  }
+
+  private uniqueAttachmentPath(folder: string, fileName: string): string {
+    const dotIndex = fileName.lastIndexOf(".");
+    const hasExtension = dotIndex > 0 && dotIndex < fileName.length - 1;
+    const base = hasExtension ? fileName.slice(0, dotIndex) : fileName;
+    const extension = hasExtension ? fileName.slice(dotIndex) : "";
+    let counter = 1;
+    while (true) {
+      const suffix = counter === 1 ? "" : `-${counter}`;
+      const candidate = normalizePath(`${folder}/${base}${suffix}${extension}`);
+      if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
+      counter += 1;
+    }
+  }
+
+  private ensureImageExtension(fileName: string, mimeType: string): string {
+    if (/\.[a-zA-Z0-9]{1,10}$/u.test(fileName)) return fileName;
+    const extensions: Record<string, string> = {
+      "image/avif": "avif",
+      "image/bmp": "bmp",
+      "image/gif": "gif",
+      "image/heic": "heic",
+      "image/heif": "heif",
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/svg+xml": "svg",
+      "image/webp": "webp"
+    };
+    const extension = extensions[mimeType.toLocaleLowerCase()] ?? "jpg";
+    return `${fileName}.${extension}`;
   }
 
   private readScalar(raw: string, field: string): string {
@@ -226,9 +400,19 @@ export class StickyNoteStorage {
 
   private readList(raw: string, field: string): string[] {
     const frontmatter = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/u)?.[1] ?? "";
-    const inlineMatch = frontmatter.match(new RegExp(`^${field}:\\s*\\[([^\\]]*)\\]`, "mu"));
+    const inlineMatch = frontmatter.match(new RegExp(`^${field}:\\s*(\\[[^\\r\\n]*\\])\\s*$`, "mu"));
     if (inlineMatch) {
-      return (inlineMatch[1] ?? "").split(",").map((item) => item.trim().replace(/^['"]|['"]$/gu, "")).filter(Boolean);
+      try {
+        const parsed = JSON.parse(inlineMatch[1] ?? "[]") as unknown;
+        if (Array.isArray(parsed)) return parsed.map((item) => String(item));
+      } catch {
+        // 兼容旧便利贴中不是严格 JSON 的 YAML 行内数组。
+      }
+      return (inlineMatch[1] ?? "")
+        .replace(/^\[|\]$/gu, "")
+        .split(",")
+        .map((item) => item.trim().replace(/^['"]|['"]$/gu, ""))
+        .filter(Boolean);
     }
     const blockMatch = frontmatter.match(new RegExp(`^${field}:\\s*\\r?\\n((?:\\s+-\\s+.*(?:\\r?\\n|$))*)`, "mu"));
     if (!blockMatch) return [];

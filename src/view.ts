@@ -1,15 +1,41 @@
 import { ItemView, Notice, setIcon, TFile, WorkspaceLeaf } from "obsidian";
 import { BianlitieActionModal } from "./action-modal";
 import { AskStickyNotesModal } from "./ask-modal";
-import { CATEGORIES, ROOT_FOLDER, VIEW_TYPE_BIANLITIE, type Category, type CategoryFilter } from "./constants";
+import {
+  CATEGORIES,
+  MAX_IMAGES_PER_NOTE,
+  ROOT_FOLDER,
+  VIEW_TYPE_BIANLITIE,
+  type Category,
+  type CategoryFilter
+} from "./constants";
 import { DeepSeekClient } from "./deepseek";
-import { NoteConflictError, StickyNoteStorage } from "./storage";
+import { BianlitieImageModal } from "./image-modal";
+import { NoteConflictError, StickyNoteStorage, type ImageUpload } from "./storage";
 import type { StickyNoteRecord } from "./types";
+import { normalizeManualTag, normalizeManualTags } from "./utils";
+
+interface PendingImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
+interface ComposerDraft {
+  manualTags: string[];
+  pendingImages: PendingImage[];
+  saving: boolean;
+}
 
 interface DraftState {
   path: string;
   body: string;
   baseBody: string;
+  manualTags: string[];
+  baseManualTags: string[];
+  images: string[];
+  baseImages: string[];
+  pendingImages: PendingImage[];
   baseRaw: string;
   baseMtime: number;
   saving: boolean;
@@ -28,13 +54,17 @@ export class BianlitieView extends ItemView {
   private searchTimer: number | null = null;
   private vaultRefreshTimer: number | null = null;
   private searchSequence = 0;
+  private pendingImageSequence = 0;
+  private composerDraft: ComposerDraft | null = null;
   private draft: DraftState | null = null;
   private searchUi: SearchUi | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
     private readonly storage: StickyNoteStorage,
-    private readonly deepseek: DeepSeekClient
+    private readonly deepseek: DeepSeekClient,
+    private readonly getManualTagHistory: () => string[],
+    private readonly rememberManualTags: (tags: string[]) => void
   ) {
     super(leaf);
   }
@@ -89,12 +119,14 @@ export class BianlitieView extends ItemView {
     composer.createEl("h2", { text: "今天想记点什么？", cls: "bianlitie-composer__prompt" });
     const textarea = composer.createEl("textarea", {
       cls: "bianlitie-note-input",
-      attr: {
-        rows: "4",
-        placeholder: "从这里开始记录…",
-        "aria-label": "便利贴内容"
-      }
+      attr: { rows: "4", placeholder: "从这里开始记录…", "aria-label": "便利贴内容" }
     });
+
+    this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
+    const composerExtras = composer.createDiv({ cls: "bianlitie-composer-extras" });
+    const composerTags = composerExtras.createDiv();
+    const composerImages = composerExtras.createDiv();
+    this.renderComposerExtras(composerTags, composerImages);
 
     const saveButton = composer.createEl("button", {
       text: "存进便利贴",
@@ -140,19 +172,15 @@ export class BianlitieView extends ItemView {
     askButton.createSpan({ text: "问便利贴" });
 
     saveButton.addEventListener("click", () => {
-      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList);
+      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList, composerTags, composerImages);
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
-      this.searchTimer = window.setTimeout(() => {
-        void this.runSearch(searchInput.value, resultStatus, resultList);
-      }, 180);
+      this.searchTimer = window.setTimeout(() => void this.runSearch(searchInput.value, resultStatus, resultList), 180);
     });
-    askButton.addEventListener("click", () => {
-      new AskStickyNotesModal(this.app, this.storage, this.deepseek).open();
-    });
+    askButton.addEventListener("click", () => new AskStickyNotesModal(this.app, this.storage, this.deepseek).open());
     this.registerVaultRefreshEvents(searchInput, resultStatus, resultList, container);
 
     void this.runSearch("", resultStatus, resultList);
@@ -162,6 +190,23 @@ export class BianlitieView extends ItemView {
     }, 0);
   }
 
+  private renderComposerExtras(tagHost: HTMLElement, imageHost: HTMLElement): void {
+    this.renderManualTagEditor(
+      tagHost,
+      () => this.composerDraft?.manualTags ?? [],
+      (tags) => { if (this.composerDraft) this.composerDraft.manualTags = tags; },
+      () => this.composerDraft?.saving ?? true
+    );
+    this.renderImageEditor(
+      imageHost,
+      () => [],
+      () => undefined,
+      () => this.composerDraft?.pendingImages ?? [],
+      (images) => { if (this.composerDraft) this.composerDraft.pendingImages = images; },
+      () => this.composerDraft?.saving ?? true
+    );
+  }
+
   private registerVaultRefreshEvents(
     searchInput: HTMLInputElement,
     status: HTMLElement,
@@ -169,7 +214,7 @@ export class BianlitieView extends ItemView {
     scrollContainer: HTMLElement
   ): void {
     const scheduleForPaths = (...paths: string[]): void => {
-      if (paths.some((path) => this.isManagedNotePath(path))) {
+      if (paths.some((path) => this.isManagedNotePath(path) || this.storage.isManagedAttachmentPath(path))) {
         this.scheduleVaultRefresh(searchInput, status, list, scrollContainer);
       }
     };
@@ -177,14 +222,17 @@ export class BianlitieView extends ItemView {
     this.registerEvent(this.app.vault.on("modify", (file) => scheduleForPaths(file.path)));
     this.registerEvent(this.app.vault.on("create", (file) => scheduleForPaths(file.path)));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (this.draft?.path === file.path) this.draft = null;
+      if (this.draft?.path === file.path) {
+        this.revokePendingImages(this.draft.pendingImages);
+        this.draft = null;
+      }
       scheduleForPaths(file.path);
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (this.draft?.path === oldPath) {
-        if (this.isManagedNotePath(file.path)) {
-          this.draft.path = file.path;
-        } else {
+        if (this.isManagedNotePath(file.path)) this.draft.path = file.path;
+        else {
+          this.revokePendingImages(this.draft.pendingImages);
           this.draft = null;
         }
       }
@@ -220,11 +268,9 @@ export class BianlitieView extends ItemView {
     const minHeight = Number.parseFloat(styles.minHeight) || 132;
     const maxHeight = Number.parseFloat(styles.maxHeight) || 232;
     const borderHeight = (Number.parseFloat(styles.borderTopWidth) || 0) + (Number.parseFloat(styles.borderBottomWidth) || 0);
-
     textarea.style.height = "auto";
     const contentHeight = textarea.scrollHeight + borderHeight;
-    const nextHeight = Math.min(Math.max(contentHeight, minHeight), maxHeight);
-    textarea.style.height = `${nextHeight}px`;
+    textarea.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
     textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
 
@@ -234,9 +280,13 @@ export class BianlitieView extends ItemView {
     categoryButtons: Map<Category, HTMLButtonElement>,
     searchInput: HTMLInputElement,
     resultStatus: HTMLElement,
-    resultList: HTMLElement
+    resultList: HTMLElement,
+    tagHost: HTMLElement,
+    imageHost: HTMLElement
   ): Promise<void> {
     const originalContent = textarea.value;
+    const composerDraft = this.composerDraft;
+    if (!composerDraft || composerDraft.saving) return;
     if (!originalContent.trim()) {
       new Notice("请先写下要记录的内容。");
       textarea.focus();
@@ -248,10 +298,31 @@ export class BianlitieView extends ItemView {
     }
 
     const category = this.selectedCategory;
+    const manualTags = [...composerDraft.manualTags];
+    const pendingImages = [...composerDraft.pendingImages];
+    composerDraft.saving = true;
     button.disabled = true;
     button.setText("正在保存…");
+    this.renderComposerExtras(tagHost, imageHost);
     try {
-      const file = await this.storage.createNote(category, originalContent);
+      const file = await this.storage.createNote(category, originalContent, manualTags);
+      if (pendingImages.length > 0) {
+        let imagePaths: string[] = [];
+        try {
+          const uploads = await this.toImageUploads(pendingImages);
+          imagePaths = await this.storage.saveImages(uploads);
+          const snapshot = await this.storage.readNoteSnapshot(file);
+          await this.storage.updateNote(file, snapshot.raw, snapshot.note.body, manualTags, imagePaths, null);
+        } catch (error) {
+          if (imagePaths.length > 0) await this.storage.discardCreatedImages(imagePaths);
+          console.warn("便利贴已保存，但图片保存失败。", error);
+          new Notice("便利贴正文已保存，但图片保存失败，请重新编辑添加。");
+        }
+      }
+      this.rememberManualTags(manualTags);
+      this.revokePendingImages(composerDraft.pendingImages);
+      this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
+      this.renderComposerExtras(tagHost, imageHost);
       textarea.value = "";
       this.resizeNoteInput(textarea);
       this.selectedCategory = null;
@@ -263,8 +334,10 @@ export class BianlitieView extends ItemView {
       await this.runSearch(searchInput.value, resultStatus, resultList);
       if (this.deepseek.isConfigured()) void this.enrichNote(file, originalContent, category);
     } catch (error) {
+      composerDraft.saving = false;
       const message = error instanceof Error ? error.message : "保存失败，请稍后重试。";
       new Notice(message);
+      this.renderComposerExtras(tagHost, imageHost);
     } finally {
       button.disabled = false;
       button.setText("存进便利贴");
@@ -292,8 +365,7 @@ export class BianlitieView extends ItemView {
       this.renderResults(list, records);
     } catch (error) {
       if (sequence !== this.searchSequence) return;
-      const message = error instanceof Error ? error.message : "搜索失败。";
-      status.setText(message);
+      status.setText(error instanceof Error ? error.message : "搜索失败。");
       list.empty();
     }
   }
@@ -319,6 +391,8 @@ export class BianlitieView extends ItemView {
       top.createSpan({ text: record.category, cls: "bianlitie-category-chip" });
       top.createSpan({ text: record.modified || "未记录时间", cls: "bianlitie-created" });
       card.createEl("p", { text: record.snippet || "暂无内容", cls: "bianlitie-body-preview" });
+      this.renderVisibleManualTags(card, record.manualTags);
+      this.renderCardImages(card, record.images);
 
       const actions = card.createDiv({ cls: "bianlitie-result-actions" });
       const editButton = actions.createEl("button", {
@@ -342,14 +416,35 @@ export class BianlitieView extends ItemView {
       });
 
       if (isEditing && this.draft) this.renderDraftEditor(card, this.draft);
-
-      card.addEventListener("click", () => {
-        void this.app.workspace.getLeaf(false).openFile(record.file);
-      });
+      card.addEventListener("click", () => void this.app.workspace.getLeaf(false).openFile(record.file));
       card.addEventListener("keydown", (event) => {
         if (event.target !== card || (event.key !== "Enter" && event.key !== " ")) return;
         event.preventDefault();
         void this.app.workspace.getLeaf(false).openFile(record.file);
+      });
+    }
+  }
+
+  private renderVisibleManualTags(card: HTMLElement, tags: string[]): void {
+    if (tags.length === 0) return;
+    const row = card.createDiv({ cls: "bianlitie-card-tags", attr: { "aria-label": "手动标签" } });
+    for (const tag of tags) row.createSpan({ text: `#${tag}`, cls: "bianlitie-card-tag" });
+  }
+
+  private renderCardImages(card: HTMLElement, imagePaths: string[]): void {
+    const available = imagePaths
+      .map((path) => ({ path, source: this.storage.getImageResourcePath(path) }))
+      .filter((item): item is { path: string; source: string } => item.source !== null)
+      .slice(0, 3);
+    if (available.length === 0) return;
+    const gallery = card.createDiv({ cls: `bianlitie-card-images bianlitie-card-images--${available.length}` });
+    gallery.addEventListener("click", (event) => event.stopPropagation());
+    for (const item of available) {
+      const button = gallery.createEl("button", { cls: "bianlitie-thumbnail", attr: { type: "button", "aria-label": "查看便利贴图片" } });
+      button.createEl("img", { attr: { src: item.source, alt: item.path, loading: "lazy" } });
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        new BianlitieImageModal(this.app, item.source, item.path.split("/").pop() ?? "便利贴图片").open();
       });
     }
   }
@@ -368,12 +463,25 @@ export class BianlitieView extends ItemView {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
     });
 
+    const tagHost = editor.createDiv();
+    this.renderManualTagEditor(
+      tagHost,
+      () => this.draft?.path === draft.path ? this.draft.manualTags : [],
+      (tags) => { if (this.draft?.path === draft.path) this.draft.manualTags = tags; },
+      () => this.draft?.path !== draft.path || this.draft.saving
+    );
+    const imageHost = editor.createDiv();
+    this.renderImageEditor(
+      imageHost,
+      () => this.draft?.path === draft.path ? this.draft.images : [],
+      (images) => { if (this.draft?.path === draft.path) this.draft.images = images; },
+      () => this.draft?.path === draft.path ? this.draft.pendingImages : [],
+      (images) => { if (this.draft?.path === draft.path) this.draft.pendingImages = images; },
+      () => this.draft?.path !== draft.path || this.draft.saving
+    );
+
     const controls = editor.createDiv({ cls: "bianlitie-draft-actions" });
-    const cancelButton = controls.createEl("button", {
-      text: "取消",
-      cls: "bianlitie-draft-cancel",
-      attr: { type: "button" }
-    });
+    const cancelButton = controls.createEl("button", { text: "取消", cls: "bianlitie-draft-cancel", attr: { type: "button" } });
     const saveButton = controls.createEl("button", {
       text: draft.saving ? "保存中…" : "保存",
       cls: "bianlitie-draft-save",
@@ -382,9 +490,174 @@ export class BianlitieView extends ItemView {
     cancelButton.disabled = draft.saving;
     saveButton.disabled = draft.saving;
     cancelButton.addEventListener("click", () => this.cancelDraft(draft.path));
-    saveButton.addEventListener("click", () => {
-      void this.saveDraft(draft.path);
-    });
+    saveButton.addEventListener("click", () => void this.saveDraft(draft.path));
+  }
+
+  private renderManualTagEditor(
+    holder: HTMLElement,
+    getTags: () => string[],
+    setTags: (tags: string[]) => void,
+    isDisabled: () => boolean
+  ): void {
+    let expanded = false;
+    const render = (): void => {
+      holder.empty();
+      holder.addClass("bianlitie-tag-editor");
+      holder.toggleClass("is-disabled", isDisabled());
+      const row = holder.createDiv({ cls: "bianlitie-tag-row" });
+      for (const tag of getTags()) {
+        const chip = row.createSpan({ cls: "bianlitie-manual-tag" });
+        chip.createSpan({ text: `#${tag}` });
+        const remove = chip.createEl("button", { attr: { type: "button", "aria-label": `删除标签 ${tag}` } });
+        setIcon(remove, "x");
+        remove.disabled = isDisabled();
+        remove.addEventListener("click", () => {
+          if (isDisabled()) return;
+          setTags(getTags().filter((item) => item !== tag));
+          render();
+        });
+      }
+      const addButton = row.createEl("button", {
+        text: "# 添加标签",
+        cls: "bianlitie-add-tag",
+        attr: { type: "button", "aria-expanded": String(expanded) }
+      });
+      addButton.disabled = isDisabled();
+      addButton.addEventListener("click", () => {
+        if (isDisabled()) return;
+        expanded = !expanded;
+        render();
+        if (expanded) window.setTimeout(() => holder.querySelector<HTMLInputElement>(".bianlitie-tag-input")?.focus(), 0);
+      });
+      if (!expanded) return;
+
+      const panel = holder.createDiv({ cls: "bianlitie-tag-panel" });
+      const inputRow = panel.createDiv({ cls: "bianlitie-tag-input-row" });
+      const input = inputRow.createEl("input", {
+        type: "text",
+        cls: "bianlitie-tag-input",
+        attr: { placeholder: "输入标签名称", "aria-label": "新手动标签" }
+      });
+      const confirm = inputRow.createEl("button", { text: "添加", attr: { type: "button" } });
+      const addValue = (): void => {
+        const tag = normalizeManualTag(input.value);
+        if (!tag) return;
+        const tags = normalizeManualTags([...getTags(), tag]);
+        if (tags.length === getTags().length) {
+          input.value = "";
+          return;
+        }
+        setTags(tags);
+        input.value = "";
+        render();
+      };
+      confirm.addEventListener("click", addValue);
+      input.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        addValue();
+      });
+
+      const history = normalizeManualTags(this.getManualTagHistory(), 50).filter((tag) => !getTags().includes(tag));
+      if (history.length > 0) {
+        panel.createDiv({ text: "历史标签", cls: "bianlitie-tag-history-label" });
+        const historyRow = panel.createDiv({ cls: "bianlitie-tag-history" });
+        for (const tag of history) {
+          const button = historyRow.createEl("button", { text: `#${tag}`, attr: { type: "button" } });
+          button.addEventListener("click", () => {
+            setTags(normalizeManualTags([...getTags(), tag]));
+            render();
+          });
+        }
+      }
+    };
+    render();
+  }
+
+  private renderImageEditor(
+    holder: HTMLElement,
+    getExisting: () => string[],
+    setExisting: (images: string[]) => void,
+    getPending: () => PendingImage[],
+    setPending: (images: PendingImage[]) => void,
+    isDisabled: () => boolean
+  ): void {
+    const render = (): void => {
+      holder.empty();
+      holder.addClass("bianlitie-image-editor");
+      const existing = getExisting();
+      const pending = getPending();
+      const gallery = holder.createDiv({ cls: "bianlitie-edit-images" });
+
+      for (const path of existing) {
+        const source = this.storage.getImageResourcePath(path);
+        this.renderEditableImage(gallery, source, path.split("/").pop() ?? "便利贴图片", () => {
+          if (isDisabled()) return;
+          setExisting(getExisting().filter((item) => item !== path));
+          render();
+        });
+      }
+      for (const image of pending) {
+        this.renderEditableImage(gallery, image.previewUrl, image.file.name, () => {
+          if (isDisabled()) return;
+          URL.revokeObjectURL(image.previewUrl);
+          setPending(getPending().filter((item) => item.id !== image.id));
+          render();
+        });
+      }
+
+      const input = holder.createEl("input", {
+        type: "file",
+        cls: "bianlitie-image-input",
+        attr: { accept: "image/*", multiple: "", "aria-label": "选择便利贴图片" }
+      });
+      const addButton = holder.createEl("button", {
+        cls: "bianlitie-add-image",
+        attr: { type: "button" }
+      });
+      const icon = addButton.createSpan();
+      setIcon(icon, "image-plus");
+      addButton.createSpan({ text: `添加图片 ${existing.length + pending.length}/${MAX_IMAGES_PER_NOTE}` });
+      addButton.disabled = isDisabled() || existing.length + pending.length >= MAX_IMAGES_PER_NOTE;
+      addButton.addEventListener("click", () => {
+        if (!addButton.disabled) input.click();
+      });
+      input.addEventListener("change", () => {
+        if (isDisabled()) return;
+        const available = MAX_IMAGES_PER_NOTE - getExisting().length - getPending().length;
+        const selected = Array.from(input.files ?? []).filter((file) => this.isImageFile(file));
+        if (selected.length > available) new Notice(`每条便利贴最多添加 ${MAX_IMAGES_PER_NOTE} 张图片。`);
+        const next = selected.slice(0, Math.max(0, available)).map((file) => ({
+          id: `${Date.now()}-${this.pendingImageSequence += 1}`,
+          file,
+          previewUrl: URL.createObjectURL(file)
+        }));
+        setPending([...getPending(), ...next]);
+        input.value = "";
+        render();
+      });
+    };
+    render();
+  }
+
+  private renderEditableImage(
+    gallery: HTMLElement,
+    source: string | null,
+    label: string,
+    onRemove: () => void
+  ): void {
+    const item = gallery.createDiv({ cls: "bianlitie-edit-image" });
+    const preview = item.createEl("button", { cls: "bianlitie-edit-image__preview", attr: { type: "button", "aria-label": `查看 ${label}` } });
+    if (source) {
+      preview.createEl("img", { attr: { src: source, alt: label } });
+      preview.addEventListener("click", () => new BianlitieImageModal(this.app, source, label).open());
+    } else {
+      preview.createSpan({ text: "图片已移动", cls: "bianlitie-image-missing" });
+      preview.disabled = true;
+    }
+    const remove = item.createEl("button", { cls: "bianlitie-edit-image__remove", attr: { type: "button", "aria-label": `移除 ${label}` } });
+    setIcon(remove, "x");
+    remove.addEventListener("click", onRemove);
   }
 
   private async beginEdit(record: StickyNoteRecord): Promise<void> {
@@ -392,10 +665,11 @@ export class BianlitieView extends ItemView {
       this.focusDraftEditor();
       return;
     }
-    if (this.draft && this.draft.body !== this.draft.baseBody) {
+    if (this.draft && this.isDraftDirty(this.draft)) {
       new Notice("请先保存或取消当前草稿，再编辑另一条便利贴。");
       return;
     }
+    if (this.draft) this.revokePendingImages(this.draft.pendingImages);
 
     const current = this.app.vault.getAbstractFileByPath(record.file.path);
     if (!(current instanceof TFile) || !this.storage.isManagedFile(current)) {
@@ -408,6 +682,11 @@ export class BianlitieView extends ItemView {
         path: current.path,
         body: snapshot.note.body,
         baseBody: snapshot.note.body,
+        manualTags: [...snapshot.note.manualTags],
+        baseManualTags: [...snapshot.note.manualTags],
+        images: [...snapshot.note.images],
+        baseImages: [...snapshot.note.images],
+        pendingImages: [],
         baseRaw: snapshot.raw,
         baseMtime: snapshot.mtime,
         saving: false
@@ -415,13 +694,13 @@ export class BianlitieView extends ItemView {
       await this.refreshResults(false);
       this.focusDraftEditor();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "无法读取便利贴正文。";
-      new Notice(message);
+      new Notice(error instanceof Error ? error.message : "无法读取便利贴正文。");
     }
   }
 
   private cancelDraft(path: string): void {
     if (this.draft?.path !== path || this.draft.saving) return;
+    this.revokePendingImages(this.draft.pendingImages);
     this.draft = null;
     void this.refreshResults(false);
   }
@@ -435,13 +714,19 @@ export class BianlitieView extends ItemView {
       return;
     }
 
+    let createdImagePaths: string[] = [];
+    let noteUpdated = false;
     try {
       const snapshot = await this.storage.readNoteSnapshot(current);
       if (snapshot.raw !== draft.baseRaw || snapshot.mtime !== draft.baseMtime) {
         this.showConflict(path);
         return;
       }
-      if (draft.body === snapshot.note.body) {
+      const bodyChanged = draft.body !== snapshot.note.body;
+      const tagsChanged = !this.sameStringArray(draft.manualTags, snapshot.note.manualTags);
+      const imagesChanged = !this.sameStringArray(draft.images, snapshot.note.images) || draft.pendingImages.length > 0;
+      if (!bodyChanged && !tagsChanged && !imagesChanged) {
+        this.revokePendingImages(draft.pendingImages);
         this.draft = null;
         await this.refreshResults(false);
         return;
@@ -449,9 +734,22 @@ export class BianlitieView extends ItemView {
 
       draft.saving = true;
       await this.refreshResults(false);
-      await this.storage.updateNoteBody(current, snapshot.raw, draft.body, new Date());
+      if (draft.pendingImages.length > 0) {
+        createdImagePaths = await this.storage.saveImages(await this.toImageUploads(draft.pendingImages));
+      }
+      const finalImages = [...draft.images, ...createdImagePaths].slice(0, MAX_IMAGES_PER_NOTE);
+      await this.storage.updateNote(
+        current,
+        snapshot.raw,
+        draft.body,
+        draft.manualTags,
+        finalImages,
+        bodyChanged ? new Date() : null
+      );
+      noteUpdated = true;
+      this.rememberManualTags(draft.manualTags);
 
-      if (this.deepseek.isConfigured() && draft.body.trim()) {
+      if (bodyChanged && this.deepseek.isConfigured() && draft.body.trim()) {
         try {
           const metadata = await this.deepseek.generateMetadata(draft.body, snapshot.note.category);
           const latestFile = this.app.vault.getAbstractFileByPath(path);
@@ -459,9 +757,7 @@ export class BianlitieView extends ItemView {
             throw new Error("便利贴在生成标签期间已被移动或删除。");
           }
           const latest = await this.storage.readNote(latestFile);
-          if (latest.body !== draft.body) {
-            throw new Error("正文在生成标签期间发生了变化。");
-          }
+          if (latest.body !== draft.body) throw new Error("正文在生成标签期间发生了变化。");
           await this.storage.updateGeneratedMetadata(latestFile, metadata);
         } catch (error) {
           console.warn("便利贴已保存，但 DeepSeek 元数据生成失败。", error);
@@ -469,16 +765,16 @@ export class BianlitieView extends ItemView {
         }
       }
 
+      this.revokePendingImages(draft.pendingImages);
       this.draft = null;
       new Notice("便利贴已保存。");
       await this.refreshResults(false);
     } catch (error) {
+      if (!noteUpdated && createdImagePaths.length > 0) await this.storage.discardCreatedImages(createdImagePaths);
       if (this.draft?.path === path) this.draft.saving = false;
-      if (error instanceof NoteConflictError) {
-        this.showConflict(path);
-      } else {
-        const message = error instanceof Error ? error.message : "便利贴保存失败。";
-        new Notice(message);
+      if (error instanceof NoteConflictError) this.showConflict(path);
+      else {
+        new Notice(error instanceof Error ? error.message : "便利贴保存失败。");
         await this.refreshResults(false);
       }
     }
@@ -489,15 +785,14 @@ export class BianlitieView extends ItemView {
       title: "便利贴已发生变化",
       message: "这条便利贴在编辑期间已发生变化，请重新载入后再编辑。",
       confirmLabel: "重新载入",
-      onConfirm: async () => {
-        await this.reloadDraft(path);
-      }
+      onConfirm: async () => this.reloadDraft(path)
     }).open();
   }
 
   private async reloadDraft(path: string): Promise<void> {
     const current = this.app.vault.getAbstractFileByPath(path);
     if (!(current instanceof TFile) || !this.storage.isManagedFile(current)) {
+      if (this.draft) this.revokePendingImages(this.draft.pendingImages);
       this.draft = null;
       new Notice("这条便利贴已不存在或已被移动。");
       await this.refreshResults(false);
@@ -505,10 +800,16 @@ export class BianlitieView extends ItemView {
     }
     try {
       const snapshot = await this.storage.readNoteSnapshot(current);
+      if (this.draft) this.revokePendingImages(this.draft.pendingImages);
       this.draft = {
         path: current.path,
         body: snapshot.note.body,
         baseBody: snapshot.note.body,
+        manualTags: [...snapshot.note.manualTags],
+        baseManualTags: [...snapshot.note.manualTags],
+        images: [...snapshot.note.images],
+        baseImages: [...snapshot.note.images],
+        pendingImages: [],
         baseRaw: snapshot.raw,
         baseMtime: snapshot.mtime,
         saving: false
@@ -516,20 +817,17 @@ export class BianlitieView extends ItemView {
       await this.refreshResults(false);
       this.focusDraftEditor();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "重新载入便利贴失败。";
-      new Notice(message);
+      new Notice(error instanceof Error ? error.message : "重新载入便利贴失败。");
     }
   }
 
   private requestDelete(record: StickyNoteRecord): void {
     new BianlitieActionModal(this.app, {
       title: "删除便利贴",
-      message: "确定删除这条便利贴吗？删除后将移除对应 Markdown 文件。",
+      message: "确定删除这条便利贴吗？对应 Markdown 文件将移入回收站；附件会保留以避免误删。",
       confirmLabel: "删除",
       danger: true,
-      onConfirm: async () => {
-        await this.deleteNote(record.file.path);
-      }
+      onConfirm: async () => this.deleteNote(record.file.path)
     }).open();
   }
 
@@ -542,13 +840,43 @@ export class BianlitieView extends ItemView {
     }
     try {
       await this.storage.trashNote(current);
-      if (this.draft?.path === path) this.draft = null;
-      new Notice("便利贴已移入回收站。");
+      if (this.draft?.path === path) {
+        this.revokePendingImages(this.draft.pendingImages);
+        this.draft = null;
+      }
+      new Notice("便利贴已移入回收站；附件已保留。");
       await this.refreshResults(false);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "删除便利贴失败。";
-      new Notice(message);
+      new Notice(error instanceof Error ? error.message : "删除便利贴失败。");
     }
+  }
+
+  private isDraftDirty(draft: DraftState): boolean {
+    return draft.body !== draft.baseBody
+      || !this.sameStringArray(draft.manualTags, draft.baseManualTags)
+      || !this.sameStringArray(draft.images, draft.baseImages)
+      || draft.pendingImages.length > 0;
+  }
+
+  private sameStringArray(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+
+  private async toImageUploads(images: PendingImage[]): Promise<ImageUpload[]> {
+    return Promise.all(images.map(async (image) => ({
+      name: image.file.name,
+      mimeType: image.file.type,
+      data: await image.file.arrayBuffer()
+    })));
+  }
+
+  private isImageFile(file: File): boolean {
+    if (file.type.startsWith("image/")) return true;
+    return /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/iu.test(file.name);
+  }
+
+  private revokePendingImages(images: PendingImage[]): void {
+    for (const image of images) URL.revokeObjectURL(image.previewUrl);
   }
 
   private async refreshResults(showLoading: boolean): Promise<void> {
@@ -562,14 +890,15 @@ export class BianlitieView extends ItemView {
   }
 
   private focusDraftEditor(): void {
-    window.requestAnimationFrame(() => {
-      this.searchUi?.list.querySelector<HTMLTextAreaElement>(".bianlitie-draft-input")?.focus();
-    });
+    window.requestAnimationFrame(() => this.searchUi?.list.querySelector<HTMLTextAreaElement>(".bianlitie-draft-input")?.focus());
   }
 
   async onClose(): Promise<void> {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
+    if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
+    if (this.draft) this.revokePendingImages(this.draft.pendingImages);
+    this.composerDraft = null;
     this.draft = null;
     this.searchUi = null;
   }

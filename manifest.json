@@ -1,7 +1,7 @@
 {
   "id": "bianlitie",
   "name": "便利贴",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "minAppVersion": "1.5.0",
   "description": "极简、快速、Markdown 优先的私人备忘录入口。",
   "author": "私人使用",

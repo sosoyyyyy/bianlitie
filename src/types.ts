@@ -4,6 +4,7 @@ import type { Category } from "./constants";
 export interface BianlitieSettings {
   deepseekApiKey: string;
   deepseekModel: string;
+  manualTagHistory: string[];
 }
 
 export interface GeneratedMetadata {
@@ -20,6 +21,8 @@ export interface StickyNoteRecord {
   modifiedTimestamp: number;
   tags: string[];
   keywords: string[];
+  manualTags: string[];
+  images: string[];
   body: string;
   snippet: string;
   score: number;

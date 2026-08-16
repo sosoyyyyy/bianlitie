@@ -57,6 +57,52 @@ export function normalizeList(values: unknown, maxItems = 8): string[] {
   return result;
 }
 
+export function normalizeManualTag(value: string): string {
+  return value
+    .replace(/^#+/u, "")
+    .replace(/[\r\n]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 30);
+}
+
+export function normalizeManualTags(values: unknown, maxItems = 20): string[] {
+  const raw = Array.isArray(values) ? values : typeof values === "string" ? [values] : [];
+  const result: string[] = [];
+  for (const item of raw) {
+    const value = normalizeManualTag(String(item));
+    if (value && !result.includes(value)) result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+export function sanitizeAttachmentFileName(fileName: string): string {
+  const cleaned = fileName
+    .replace(/[\\/:*?"<>|\[\]\u0000-\u001f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[. ]+$/gu, "");
+  if (!cleaned) return "image";
+
+  const dotIndex = cleaned.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === cleaned.length - 1) return cleaned.slice(0, 80);
+  const base = cleaned.slice(0, dotIndex).trim().slice(0, 70) || "image";
+  const extension = cleaned.slice(dotIndex + 1).replace(/[^a-zA-Z0-9]/gu, "").slice(0, 10);
+  return extension ? `${base}.${extension}` : base;
+}
+
+export function normalizeImagePaths(values: unknown, maxItems = 5): string[] {
+  const raw = Array.isArray(values) ? values : typeof values === "string" ? [values] : [];
+  const result: string[] = [];
+  for (const item of raw) {
+    const value = String(item).replace(/[\r\n]/gu, "").trim().slice(0, 500);
+    if (value && !result.includes(value)) result.push(value);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
 export function extractSearchTerms(query: string): string[] {
   const normalized = query.toLocaleLowerCase().trim();
   if (!normalized) return [];

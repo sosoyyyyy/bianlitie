@@ -4,11 +4,13 @@ import { DeepSeekClient } from "./deepseek";
 import { BianlitieSettingTab } from "./settings";
 import { StickyNoteStorage } from "./storage";
 import type { BianlitieSettings } from "./types";
+import { normalizeManualTags } from "./utils";
 import { BianlitieView } from "./view";
 
 const DEFAULT_SETTINGS: BianlitieSettings = {
   deepseekApiKey: "",
-  deepseekModel: DEFAULT_MODEL
+  deepseekModel: DEFAULT_MODEL,
+  manualTagHistory: []
 };
 
 export default class BianlitiePlugin extends Plugin {
@@ -23,7 +25,13 @@ export default class BianlitiePlugin extends Plugin {
 
     this.registerView(
       VIEW_TYPE_BIANLITIE,
-      (leaf) => new BianlitieView(leaf, this.storage, this.deepseek)
+      (leaf) => new BianlitieView(
+        leaf,
+        this.storage,
+        this.deepseek,
+        () => this.settings.manualTagHistory,
+        (tags) => this.rememberManualTags(tags)
+      )
     );
     this.addRibbonIcon("sticky-note", "打开便利贴", () => {
       void this.activateView();
@@ -43,6 +51,13 @@ export default class BianlitiePlugin extends Plugin {
       }
     });
     this.addSettingTab(new BianlitieSettingTab(this.app, this));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (!(file instanceof TFile)
+        || (!this.storage.isManagedAttachmentPath(oldPath) && !this.storage.isImagePath(oldPath))) return;
+      void this.storage.updateImagePath(oldPath, file.path).catch((error) => {
+        console.warn("便利贴附件路径更新失败。", error);
+      });
+    }));
 
     try {
       await this.storage.ensureFolders();
@@ -106,9 +121,18 @@ export default class BianlitiePlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const saved = await this.loadData() as Partial<BianlitieSettings> | null;
     this.settings = { ...DEFAULT_SETTINGS, ...(saved ?? {}) };
+    this.settings.manualTagHistory = normalizeManualTags(this.settings.manualTagHistory, 50);
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  private rememberManualTags(tags: string[]): void {
+    const next = normalizeManualTags([...this.settings.manualTagHistory, ...tags], 50);
+    if (next.length === this.settings.manualTagHistory.length
+      && next.every((tag, index) => tag === this.settings.manualTagHistory[index])) return;
+    this.settings.manualTagHistory = next;
+    void this.saveSettings().catch((error) => console.warn("便利贴历史标签保存失败。", error));
   }
 }
