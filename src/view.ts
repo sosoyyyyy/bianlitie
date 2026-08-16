@@ -60,6 +60,9 @@ export class BianlitieView extends ItemView {
   private searchUi: SearchUi | null = null;
   private viewportCleanup: (() => void) | null = null;
   private viewportFrame: number | null = null;
+  private keyboardRecoveryFrame: number | null = null;
+  private keyboardOpen = false;
+  private activeEditor: HTMLTextAreaElement | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -127,8 +130,11 @@ export class BianlitieView extends ItemView {
     this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
     const composerExtras = composer.createDiv({ cls: "bianlitie-composer-extras" });
     const composerTags = composerExtras.createDiv();
+    const composerActions = composerExtras.createDiv({ cls: "bianlitie-input-actions" });
+    const composerTagAction = composerActions.createDiv({ cls: "bianlitie-input-action" });
+    const composerImageAction = composerActions.createDiv({ cls: "bianlitie-input-action" });
     const composerImages = composerExtras.createDiv();
-    this.renderComposerExtras(composerTags, composerImages);
+    this.renderComposerExtras(composerTags, composerImages, composerTagAction, composerImageAction);
 
     const saveButton = composer.createEl("button", {
       text: "存进便利贴",
@@ -175,10 +181,21 @@ export class BianlitieView extends ItemView {
     askButton.createSpan({ text: "问", cls: "bianlitie-ask-button__label bianlitie-ask-button__label--compact" });
 
     saveButton.addEventListener("click", () => {
-      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList, composerTags, composerImages);
+      void this.saveNote(
+        textarea,
+        saveButton,
+        categoryButtons,
+        searchInput,
+        resultStatus,
+        resultList,
+        composerTags,
+        composerImages,
+        composerTagAction,
+        composerImageAction
+      );
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
-    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
+    textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
@@ -195,15 +212,22 @@ export class BianlitieView extends ItemView {
     }, 0);
   }
 
-  private renderComposerExtras(tagHost: HTMLElement, imageHost: HTMLElement): void {
+  private renderComposerExtras(
+    tagHost: HTMLElement,
+    imageHost: HTMLElement,
+    tagActionHost: HTMLElement,
+    imageActionHost: HTMLElement
+  ): void {
     this.renderManualTagEditor(
       tagHost,
+      tagActionHost,
       () => this.composerDraft?.manualTags ?? [],
       (tags) => { if (this.composerDraft) this.composerDraft.manualTags = tags; },
       () => this.composerDraft?.saving ?? true
     );
     this.renderImageEditor(
       imageHost,
+      imageActionHost,
       () => [],
       () => undefined,
       () => this.composerDraft?.pendingImages ?? [],
@@ -290,10 +314,18 @@ export class BianlitieView extends ItemView {
         ? Math.max(0, window.innerHeight - viewportHeight)
         : 0;
       const keyboardHeight = measuredInset >= 72 ? measuredInset : 0;
+      const wasKeyboardOpen = this.keyboardOpen;
+      const isKeyboardOpen = keyboardHeight > 0;
+      this.keyboardOpen = isKeyboardOpen;
       container.style.setProperty("--bianlitie-keyboard-height", `${Math.round(keyboardHeight)}px`);
       container.style.setProperty("--bianlitie-visual-viewport-height", `${Math.round(viewportHeight)}px`);
-      container.toggleClass("is-keyboard-open", keyboardHeight > 0);
-      this.scheduleFocusedInputVisibility();
+      container.toggleClass("is-keyboard-open", isKeyboardOpen);
+      if (wasKeyboardOpen && !isKeyboardOpen) this.scheduleKeyboardRecovery();
+      else if (isKeyboardOpen) {
+        if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
+        this.keyboardRecoveryFrame = null;
+        this.scheduleFocusedInputVisibility();
+      }
     };
 
     visualViewport?.addEventListener("resize", update);
@@ -306,6 +338,7 @@ export class BianlitieView extends ItemView {
       container.style.removeProperty("--bianlitie-keyboard-height");
       container.style.removeProperty("--bianlitie-visual-viewport-height");
       container.removeClass("is-keyboard-open");
+      this.keyboardOpen = false;
     };
     update();
   }
@@ -317,6 +350,40 @@ export class BianlitieView extends ItemView {
       this.viewportFrame = null;
       this.keepFocusedInputVisible();
     });
+  }
+
+  private handleEditorFocus(textarea: HTMLTextAreaElement): void {
+    this.activeEditor = textarea;
+    this.scheduleFocusedInputVisibility();
+  }
+
+  private scheduleKeyboardRecovery(): void {
+    if (!window.matchMedia("(max-width: 600px)").matches) return;
+    if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
+    this.keyboardRecoveryFrame = window.requestAnimationFrame(() => {
+      this.keyboardRecoveryFrame = null;
+      this.recoverActiveEditorCard();
+    });
+  }
+
+  private recoverActiveEditorCard(): void {
+    const ui = this.searchUi;
+    const editor = this.activeEditor;
+    if (this.keyboardOpen || !ui || !editor?.isConnected) return;
+    if (!editor.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
+
+    const card = editor.closest<HTMLElement>(
+      editor.matches(".bianlitie-note-input") ? ".bianlitie-composer" : ".bianlitie-result-card"
+    );
+    if (!card?.isConnected) return;
+
+    const visualViewport = window.visualViewport;
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const containerTop = ui.scrollContainer.getBoundingClientRect().top;
+    const desiredTop = Math.max(viewportTop, containerTop) + 20;
+    const delta = card.getBoundingClientRect().top - desiredTop;
+    if (Math.abs(delta) < 2) return;
+    ui.scrollContainer.scrollTop = Math.max(0, ui.scrollContainer.scrollTop + delta);
   }
 
   private keepFocusedInputVisible(): void {
@@ -347,7 +414,9 @@ export class BianlitieView extends ItemView {
     resultStatus: HTMLElement,
     resultList: HTMLElement,
     tagHost: HTMLElement,
-    imageHost: HTMLElement
+    imageHost: HTMLElement,
+    tagActionHost: HTMLElement,
+    imageActionHost: HTMLElement
   ): Promise<void> {
     const originalContent = textarea.value;
     const composerDraft = this.composerDraft;
@@ -368,7 +437,7 @@ export class BianlitieView extends ItemView {
     composerDraft.saving = true;
     button.disabled = true;
     button.setText("正在保存…");
-    this.renderComposerExtras(tagHost, imageHost);
+    this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
     try {
       const file = await this.storage.createNote(category, originalContent, manualTags);
       if (pendingImages.length > 0) {
@@ -387,7 +456,7 @@ export class BianlitieView extends ItemView {
       this.rememberManualTags(manualTags);
       this.revokePendingImages(composerDraft.pendingImages);
       this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
-      this.renderComposerExtras(tagHost, imageHost);
+      this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
       textarea.value = "";
       this.resizeNoteInput(textarea);
       this.selectedCategory = null;
@@ -402,7 +471,7 @@ export class BianlitieView extends ItemView {
       composerDraft.saving = false;
       const message = error instanceof Error ? error.message : "保存失败，请稍后重试。";
       new Notice(message);
-      this.renderComposerExtras(tagHost, imageHost);
+      this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
     } finally {
       button.disabled = false;
       button.setText("存进便利贴");
@@ -524,21 +593,27 @@ export class BianlitieView extends ItemView {
     });
     textarea.value = draft.body;
     textarea.disabled = draft.saving;
-    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
+    textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
     });
 
-    const tagHost = editor.createDiv();
+    const extras = editor.createDiv({ cls: "bianlitie-draft-extras" });
+    const tagHost = extras.createDiv();
+    const actions = extras.createDiv({ cls: "bianlitie-input-actions" });
+    const tagAction = actions.createDiv({ cls: "bianlitie-input-action" });
+    const imageAction = actions.createDiv({ cls: "bianlitie-input-action" });
+    const imageHost = extras.createDiv();
     this.renderManualTagEditor(
       tagHost,
+      tagAction,
       () => this.draft?.path === draft.path ? this.draft.manualTags : [],
       (tags) => { if (this.draft?.path === draft.path) this.draft.manualTags = tags; },
       () => this.draft?.path !== draft.path || this.draft.saving
     );
-    const imageHost = editor.createDiv();
     this.renderImageEditor(
       imageHost,
+      imageAction,
       () => this.draft?.path === draft.path ? this.draft.images : [],
       (images) => { if (this.draft?.path === draft.path) this.draft.images = images; },
       () => this.draft?.path === draft.path ? this.draft.pendingImages : [],
@@ -561,6 +636,7 @@ export class BianlitieView extends ItemView {
 
   private renderManualTagEditor(
     holder: HTMLElement,
+    actionHost: HTMLElement,
     getTags: () => string[],
     setTags: (tags: string[]) => void,
     isDisabled: () => boolean
@@ -568,6 +644,7 @@ export class BianlitieView extends ItemView {
     let expanded = false;
     const render = (): void => {
       holder.empty();
+      actionHost.empty();
       holder.addClass("bianlitie-tag-editor");
       holder.toggleClass("is-disabled", isDisabled());
       const row = holder.createDiv({ cls: "bianlitie-tag-row" });
@@ -583,7 +660,7 @@ export class BianlitieView extends ItemView {
           render();
         });
       }
-      const addButton = row.createEl("button", {
+      const addButton = actionHost.createEl("button", {
         text: "# 添加标签",
         cls: "bianlitie-add-tag",
         attr: { type: "button", "aria-expanded": String(expanded) }
@@ -642,6 +719,7 @@ export class BianlitieView extends ItemView {
 
   private renderImageEditor(
     holder: HTMLElement,
+    actionHost: HTMLElement,
     getExisting: () => string[],
     setExisting: (images: string[]) => void,
     getPending: () => PendingImage[],
@@ -650,6 +728,7 @@ export class BianlitieView extends ItemView {
   ): void {
     const render = (): void => {
       holder.empty();
+      actionHost.empty();
       holder.addClass("bianlitie-image-editor");
       const existing = getExisting();
       const pending = getPending();
@@ -672,12 +751,12 @@ export class BianlitieView extends ItemView {
         });
       }
 
-      const input = holder.createEl("input", {
+      const input = actionHost.createEl("input", {
         type: "file",
         cls: "bianlitie-image-input",
         attr: { accept: "image/*", multiple: "", "aria-label": "选择便利贴图片" }
       });
-      const addButton = holder.createEl("button", {
+      const addButton = actionHost.createEl("button", {
         cls: "bianlitie-add-image",
         attr: { type: "button" }
       });
@@ -963,7 +1042,9 @@ export class BianlitieView extends ItemView {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
     if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
+    if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
     this.viewportFrame = null;
+    this.keyboardRecoveryFrame = null;
     this.viewportCleanup?.();
     this.viewportCleanup = null;
     if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
@@ -971,5 +1052,7 @@ export class BianlitieView extends ItemView {
     this.composerDraft = null;
     this.draft = null;
     this.searchUi = null;
+    this.activeEditor = null;
+    this.keyboardOpen = false;
   }
 }

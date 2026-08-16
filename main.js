@@ -735,6 +735,9 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.searchUi = null;
     this.viewportCleanup = null;
     this.viewportFrame = null;
+    this.keyboardRecoveryFrame = null;
+    this.keyboardOpen = false;
+    this.activeEditor = null;
   }
   getViewType() {
     return VIEW_TYPE_BIANLITIE;
@@ -784,8 +787,11 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
     const composerExtras = composer.createDiv({ cls: "bianlitie-composer-extras" });
     const composerTags = composerExtras.createDiv();
+    const composerActions = composerExtras.createDiv({ cls: "bianlitie-input-actions" });
+    const composerTagAction = composerActions.createDiv({ cls: "bianlitie-input-action" });
+    const composerImageAction = composerActions.createDiv({ cls: "bianlitie-input-action" });
     const composerImages = composerExtras.createDiv();
-    this.renderComposerExtras(composerTags, composerImages);
+    this.renderComposerExtras(composerTags, composerImages, composerTagAction, composerImageAction);
     const saveButton = composer.createEl("button", {
       text: "\u5B58\u8FDB\u4FBF\u5229\u8D34",
       cls: "bianlitie-primary-button bianlitie-save-button",
@@ -828,10 +834,21 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     askButton.createSpan({ text: "\u95EE\u4FBF\u5229\u8D34", cls: "bianlitie-ask-button__label bianlitie-ask-button__label--full" });
     askButton.createSpan({ text: "\u95EE", cls: "bianlitie-ask-button__label bianlitie-ask-button__label--compact" });
     saveButton.addEventListener("click", () => {
-      void this.saveNote(textarea, saveButton, categoryButtons, searchInput, resultStatus, resultList, composerTags, composerImages);
+      void this.saveNote(
+        textarea,
+        saveButton,
+        categoryButtons,
+        searchInput,
+        resultStatus,
+        resultList,
+        composerTags,
+        composerImages,
+        composerTagAction,
+        composerImageAction
+      );
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
-    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
+    textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
@@ -846,9 +863,10 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       textarea.focus();
     }, 0);
   }
-  renderComposerExtras(tagHost, imageHost) {
+  renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost) {
     this.renderManualTagEditor(
       tagHost,
+      tagActionHost,
       () => this.composerDraft?.manualTags ?? [],
       (tags) => {
         if (this.composerDraft) this.composerDraft.manualTags = tags;
@@ -857,6 +875,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     );
     this.renderImageEditor(
       imageHost,
+      imageActionHost,
       () => [],
       () => void 0,
       () => this.composerDraft?.pendingImages ?? [],
@@ -927,10 +946,18 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       const viewportHeight = visualViewport?.height ?? window.innerHeight;
       const measuredInset = visualViewport ? Math.max(0, window.innerHeight - viewportHeight) : 0;
       const keyboardHeight = measuredInset >= 72 ? measuredInset : 0;
+      const wasKeyboardOpen = this.keyboardOpen;
+      const isKeyboardOpen = keyboardHeight > 0;
+      this.keyboardOpen = isKeyboardOpen;
       container.style.setProperty("--bianlitie-keyboard-height", `${Math.round(keyboardHeight)}px`);
       container.style.setProperty("--bianlitie-visual-viewport-height", `${Math.round(viewportHeight)}px`);
-      container.toggleClass("is-keyboard-open", keyboardHeight > 0);
-      this.scheduleFocusedInputVisibility();
+      container.toggleClass("is-keyboard-open", isKeyboardOpen);
+      if (wasKeyboardOpen && !isKeyboardOpen) this.scheduleKeyboardRecovery();
+      else if (isKeyboardOpen) {
+        if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
+        this.keyboardRecoveryFrame = null;
+        this.scheduleFocusedInputVisibility();
+      }
     };
     visualViewport?.addEventListener("resize", update);
     visualViewport?.addEventListener("scroll", update);
@@ -942,6 +969,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       container.style.removeProperty("--bianlitie-keyboard-height");
       container.style.removeProperty("--bianlitie-visual-viewport-height");
       container.removeClass("is-keyboard-open");
+      this.keyboardOpen = false;
     };
     update();
   }
@@ -952,6 +980,35 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       this.viewportFrame = null;
       this.keepFocusedInputVisible();
     });
+  }
+  handleEditorFocus(textarea) {
+    this.activeEditor = textarea;
+    this.scheduleFocusedInputVisibility();
+  }
+  scheduleKeyboardRecovery() {
+    if (!window.matchMedia("(max-width: 600px)").matches) return;
+    if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
+    this.keyboardRecoveryFrame = window.requestAnimationFrame(() => {
+      this.keyboardRecoveryFrame = null;
+      this.recoverActiveEditorCard();
+    });
+  }
+  recoverActiveEditorCard() {
+    const ui = this.searchUi;
+    const editor = this.activeEditor;
+    if (this.keyboardOpen || !ui || !editor?.isConnected) return;
+    if (!editor.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
+    const card = editor.closest(
+      editor.matches(".bianlitie-note-input") ? ".bianlitie-composer" : ".bianlitie-result-card"
+    );
+    if (!card?.isConnected) return;
+    const visualViewport = window.visualViewport;
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const containerTop = ui.scrollContainer.getBoundingClientRect().top;
+    const desiredTop = Math.max(viewportTop, containerTop) + 20;
+    const delta = card.getBoundingClientRect().top - desiredTop;
+    if (Math.abs(delta) < 2) return;
+    ui.scrollContainer.scrollTop = Math.max(0, ui.scrollContainer.scrollTop + delta);
   }
   keepFocusedInputVisible() {
     const ui = this.searchUi;
@@ -971,7 +1028,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       ui.scrollContainer.scrollTop -= visibleTop - bounds.top;
     }
   }
-  async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList, tagHost, imageHost) {
+  async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList, tagHost, imageHost, tagActionHost, imageActionHost) {
     const originalContent = textarea.value;
     const composerDraft = this.composerDraft;
     if (!composerDraft || composerDraft.saving) return;
@@ -990,7 +1047,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     composerDraft.saving = true;
     button.disabled = true;
     button.setText("\u6B63\u5728\u4FDD\u5B58\u2026");
-    this.renderComposerExtras(tagHost, imageHost);
+    this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
     try {
       const file = await this.storage.createNote(category, originalContent, manualTags);
       if (pendingImages.length > 0) {
@@ -1009,7 +1066,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       this.rememberManualTags(manualTags);
       this.revokePendingImages(composerDraft.pendingImages);
       this.composerDraft = { manualTags: [], pendingImages: [], saving: false };
-      this.renderComposerExtras(tagHost, imageHost);
+      this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
       textarea.value = "";
       this.resizeNoteInput(textarea);
       this.selectedCategory = null;
@@ -1024,7 +1081,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       composerDraft.saving = false;
       const message = error instanceof Error ? error.message : "\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
       new import_obsidian7.Notice(message);
-      this.renderComposerExtras(tagHost, imageHost);
+      this.renderComposerExtras(tagHost, imageHost, tagActionHost, imageActionHost);
     } finally {
       button.disabled = false;
       button.setText("\u5B58\u8FDB\u4FBF\u5229\u8D34");
@@ -1134,22 +1191,28 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     });
     textarea.value = draft.body;
     textarea.disabled = draft.saving;
-    textarea.addEventListener("focus", () => this.scheduleFocusedInputVisibility());
+    textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
     });
-    const tagHost = editor.createDiv();
+    const extras = editor.createDiv({ cls: "bianlitie-draft-extras" });
+    const tagHost = extras.createDiv();
+    const actions = extras.createDiv({ cls: "bianlitie-input-actions" });
+    const tagAction = actions.createDiv({ cls: "bianlitie-input-action" });
+    const imageAction = actions.createDiv({ cls: "bianlitie-input-action" });
+    const imageHost = extras.createDiv();
     this.renderManualTagEditor(
       tagHost,
+      tagAction,
       () => this.draft?.path === draft.path ? this.draft.manualTags : [],
       (tags) => {
         if (this.draft?.path === draft.path) this.draft.manualTags = tags;
       },
       () => this.draft?.path !== draft.path || this.draft.saving
     );
-    const imageHost = editor.createDiv();
     this.renderImageEditor(
       imageHost,
+      imageAction,
       () => this.draft?.path === draft.path ? this.draft.images : [],
       (images) => {
         if (this.draft?.path === draft.path) this.draft.images = images;
@@ -1172,10 +1235,11 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     cancelButton.addEventListener("click", () => this.cancelDraft(draft.path));
     saveButton.addEventListener("click", () => void this.saveDraft(draft.path));
   }
-  renderManualTagEditor(holder, getTags, setTags, isDisabled) {
+  renderManualTagEditor(holder, actionHost, getTags, setTags, isDisabled) {
     let expanded = false;
     const render = () => {
       holder.empty();
+      actionHost.empty();
       holder.addClass("bianlitie-tag-editor");
       holder.toggleClass("is-disabled", isDisabled());
       const row = holder.createDiv({ cls: "bianlitie-tag-row" });
@@ -1191,7 +1255,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
           render();
         });
       }
-      const addButton = row.createEl("button", {
+      const addButton = actionHost.createEl("button", {
         text: "# \u6DFB\u52A0\u6807\u7B7E",
         cls: "bianlitie-add-tag",
         attr: { type: "button", "aria-expanded": String(expanded) }
@@ -1245,9 +1309,10 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     };
     render();
   }
-  renderImageEditor(holder, getExisting, setExisting, getPending, setPending, isDisabled) {
+  renderImageEditor(holder, actionHost, getExisting, setExisting, getPending, setPending, isDisabled) {
     const render = () => {
       holder.empty();
+      actionHost.empty();
       holder.addClass("bianlitie-image-editor");
       const existing = getExisting();
       const pending = getPending();
@@ -1268,12 +1333,12 @@ var BianlitieView = class extends import_obsidian7.ItemView {
           render();
         });
       }
-      const input = holder.createEl("input", {
+      const input = actionHost.createEl("input", {
         type: "file",
         cls: "bianlitie-image-input",
         attr: { accept: "image/*", multiple: "", "aria-label": "\u9009\u62E9\u4FBF\u5229\u8D34\u56FE\u7247" }
       });
-      const addButton = holder.createEl("button", {
+      const addButton = actionHost.createEl("button", {
         cls: "bianlitie-add-image",
         attr: { type: "button" }
       });
@@ -1530,7 +1595,9 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
     if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
+    if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
     this.viewportFrame = null;
+    this.keyboardRecoveryFrame = null;
     this.viewportCleanup?.();
     this.viewportCleanup = null;
     if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
@@ -1538,6 +1605,8 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.composerDraft = null;
     this.draft = null;
     this.searchUi = null;
+    this.activeEditor = null;
+    this.keyboardOpen = false;
   }
 };
 
