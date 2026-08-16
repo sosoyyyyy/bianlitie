@@ -1,6 +1,6 @@
 {
   "name": "bianlitie",
-  "version": "0.1.5-beta.2",
+  "version": "0.1.5-beta.3",
   "description": "跨 Windows、iOS 与 Android 的极简 Obsidian 便利贴插件",
   "main": "main.js",
   "type": "module",

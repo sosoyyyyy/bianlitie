@@ -362,26 +362,31 @@ export class BianlitieView extends ItemView {
     if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
     this.keyboardRecoveryFrame = window.requestAnimationFrame(() => {
       this.keyboardRecoveryFrame = null;
-      this.recoverActiveEditorCard();
+      this.recoverActiveEditorPosition();
     });
   }
 
-  private recoverActiveEditorCard(): void {
-    const ui = this.searchUi;
+  private recoverActiveEditorPosition(): void {
     const editor = this.activeEditor;
-    if (this.keyboardOpen || !ui || !editor?.isConnected) return;
+    if (this.keyboardOpen || !editor?.isConnected) return;
     if (!editor.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
+    this.positionEditorNearViewportTop(editor, false);
+  }
 
-    const card = editor.closest<HTMLElement>(
-      editor.matches(".bianlitie-note-input") ? ".bianlitie-composer" : ".bianlitie-result-card"
-    );
-    if (!card?.isConnected) return;
+  private positionEditorNearViewportTop(editor: HTMLTextAreaElement, force: boolean): void {
+    const ui = this.searchUi;
+    if (!ui || !editor.isConnected) return;
 
     const visualViewport = window.visualViewport;
     const viewportTop = visualViewport?.offsetTop ?? 0;
-    const containerTop = ui.scrollContainer.getBoundingClientRect().top;
-    const desiredTop = Math.max(viewportTop, containerTop) + 20;
-    const delta = card.getBoundingClientRect().top - desiredTop;
+    const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const containerBounds = ui.scrollContainer.getBoundingClientRect();
+    const desiredTop = Math.max(viewportTop, containerBounds.top) + 20;
+    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom) - 20;
+    const editorBounds = editor.getBoundingClientRect();
+    if (!force && editorBounds.top >= desiredTop && editorBounds.bottom <= visibleBottom) return;
+
+    const delta = editorBounds.top - desiredTop;
     if (Math.abs(delta) < 2) return;
     ui.scrollContainer.scrollTop = Math.max(0, ui.scrollContainer.scrollTop + delta);
   }
@@ -395,10 +400,11 @@ export class BianlitieView extends ItemView {
     const visualViewport = window.visualViewport;
     const viewportTop = visualViewport?.offsetTop ?? 0;
     const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const containerBounds = ui.scrollContainer.getBoundingClientRect();
     const margin = 16;
     const bounds = active.getBoundingClientRect();
-    const visibleTop = viewportTop + margin;
-    const visibleBottom = viewportBottom - margin;
+    const visibleTop = Math.max(viewportTop, containerBounds.top) + margin;
+    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom) - margin;
     if (bounds.bottom > visibleBottom) {
       ui.scrollContainer.scrollTop += bounds.bottom - visibleBottom;
     } else if (bounds.top < visibleTop) {
@@ -1035,7 +1041,13 @@ export class BianlitieView extends ItemView {
   }
 
   private focusDraftEditor(): void {
-    window.requestAnimationFrame(() => this.searchUi?.list.querySelector<HTMLTextAreaElement>(".bianlitie-draft-input")?.focus());
+    window.requestAnimationFrame(() => {
+      const textarea = this.searchUi?.list.querySelector<HTMLTextAreaElement>(".bianlitie-draft-input");
+      if (!textarea) return;
+      this.activeEditor = textarea;
+      if (window.matchMedia("(max-width: 600px)").matches) this.positionEditorNearViewportTop(textarea, true);
+      textarea.focus({ preventScroll: true });
+    });
   }
 
   async onClose(): Promise<void> {

@@ -990,23 +990,27 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
     this.keyboardRecoveryFrame = window.requestAnimationFrame(() => {
       this.keyboardRecoveryFrame = null;
-      this.recoverActiveEditorCard();
+      this.recoverActiveEditorPosition();
     });
   }
-  recoverActiveEditorCard() {
-    const ui = this.searchUi;
+  recoverActiveEditorPosition() {
     const editor = this.activeEditor;
-    if (this.keyboardOpen || !ui || !editor?.isConnected) return;
+    if (this.keyboardOpen || !editor?.isConnected) return;
     if (!editor.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
-    const card = editor.closest(
-      editor.matches(".bianlitie-note-input") ? ".bianlitie-composer" : ".bianlitie-result-card"
-    );
-    if (!card?.isConnected) return;
+    this.positionEditorNearViewportTop(editor, false);
+  }
+  positionEditorNearViewportTop(editor, force) {
+    const ui = this.searchUi;
+    if (!ui || !editor.isConnected) return;
     const visualViewport = window.visualViewport;
     const viewportTop = visualViewport?.offsetTop ?? 0;
-    const containerTop = ui.scrollContainer.getBoundingClientRect().top;
-    const desiredTop = Math.max(viewportTop, containerTop) + 20;
-    const delta = card.getBoundingClientRect().top - desiredTop;
+    const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const containerBounds = ui.scrollContainer.getBoundingClientRect();
+    const desiredTop = Math.max(viewportTop, containerBounds.top) + 20;
+    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom) - 20;
+    const editorBounds = editor.getBoundingClientRect();
+    if (!force && editorBounds.top >= desiredTop && editorBounds.bottom <= visibleBottom) return;
+    const delta = editorBounds.top - desiredTop;
     if (Math.abs(delta) < 2) return;
     ui.scrollContainer.scrollTop = Math.max(0, ui.scrollContainer.scrollTop + delta);
   }
@@ -1018,10 +1022,11 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     const visualViewport = window.visualViewport;
     const viewportTop = visualViewport?.offsetTop ?? 0;
     const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const containerBounds = ui.scrollContainer.getBoundingClientRect();
     const margin = 16;
     const bounds = active.getBoundingClientRect();
-    const visibleTop = viewportTop + margin;
-    const visibleBottom = viewportBottom - margin;
+    const visibleTop = Math.max(viewportTop, containerBounds.top) + margin;
+    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom) - margin;
     if (bounds.bottom > visibleBottom) {
       ui.scrollContainer.scrollTop += bounds.bottom - visibleBottom;
     } else if (bounds.top < visibleTop) {
@@ -1589,7 +1594,13 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     });
   }
   focusDraftEditor() {
-    window.requestAnimationFrame(() => this.searchUi?.list.querySelector(".bianlitie-draft-input")?.focus());
+    window.requestAnimationFrame(() => {
+      const textarea = this.searchUi?.list.querySelector(".bianlitie-draft-input");
+      if (!textarea) return;
+      this.activeEditor = textarea;
+      if (window.matchMedia("(max-width: 600px)").matches) this.positionEditorNearViewportTop(textarea, true);
+      textarea.focus({ preventScroll: true });
+    });
   }
   async onClose() {
     if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
