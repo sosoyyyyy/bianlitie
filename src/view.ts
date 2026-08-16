@@ -61,8 +61,13 @@ export class BianlitieView extends ItemView {
   private viewportCleanup: (() => void) | null = null;
   private viewportFrame: number | null = null;
   private keyboardRecoveryFrame: number | null = null;
+  private keyboardStateFrame: number | null = null;
+  private caretFrame: number | null = null;
   private keyboardOpen = false;
+  private viewportBaselineHeight = 0;
+  private viewportBaselineWidth = 0;
   private activeEditor: HTMLTextAreaElement | null = null;
+  private textareaMirror: HTMLDivElement | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -196,6 +201,7 @@ export class BianlitieView extends ItemView {
     });
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
     textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
+    textarea.addEventListener("click", () => this.scheduleCaretVisibility(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
@@ -293,6 +299,11 @@ export class BianlitieView extends ItemView {
   }
 
   private resizeNoteInput(textarea: HTMLTextAreaElement, allowShrink = false): void {
+    if (window.matchMedia("(max-width: 600px)").matches) {
+      this.resizeMobileEditor(textarea);
+      return;
+    }
+
     const styles = window.getComputedStyle(textarea);
     const minHeight = Number.parseFloat(styles.minHeight) || 132;
     const maxHeight = Number.parseFloat(styles.maxHeight) || 232;
@@ -305,39 +316,205 @@ export class BianlitieView extends ItemView {
     textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
   }
 
+  private resizeMobileEditor(textarea: HTMLTextAreaElement): void {
+    if (!window.matchMedia("(max-width: 600px)").matches || !textarea.isConnected) return;
+    const styles = window.getComputedStyle(textarea);
+    const minHeight = Number.parseFloat(styles.minHeight) || 116;
+    const { contentHeight } = this.measureTextarea(textarea, null);
+    const naturalHeight = Math.max(minHeight, Math.ceil(contentHeight));
+
+    if (!this.keyboardOpen) {
+      textarea.style.height = `${naturalHeight}px`;
+      textarea.style.maxHeight = "none";
+      textarea.style.overflowY = "hidden";
+      textarea.removeClass("is-mobile-editor-constrained");
+      textarea.scrollTop = 0;
+      return;
+    }
+
+    const maxHeight = this.calculateMobileEditorMaxHeight(minHeight);
+    const constrained = naturalHeight > maxHeight + 1;
+    textarea.style.height = `${Math.min(naturalHeight, maxHeight)}px`;
+    textarea.style.maxHeight = `${maxHeight}px`;
+    textarea.style.overflowY = constrained ? "auto" : "hidden";
+    textarea.toggleClass("is-mobile-editor-constrained", constrained);
+    this.searchUi?.scrollContainer.style.setProperty("--bianlitie-mobile-editor-max-height", `${maxHeight}px`);
+    if (!constrained) textarea.scrollTop = 0;
+  }
+
+  private calculateMobileEditorMaxHeight(minHeight: number): number {
+    const ui = this.searchUi;
+    const visualViewport = window.visualViewport;
+    if (!ui) return minHeight;
+
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const containerBounds = ui.scrollContainer.getBoundingClientRect();
+    const visibleTop = Math.max(viewportTop, containerBounds.top);
+    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom);
+    const visibleHeight = Math.max(minHeight, visibleBottom - visibleTop);
+    const edgeLimitedHeight = visibleHeight - 56;
+    const comfortableHeight = visibleHeight * 0.68;
+    return Math.max(minHeight, Math.floor(Math.min(edgeLimitedHeight, comfortableHeight)));
+  }
+
+  private measureTextarea(
+    textarea: HTMLTextAreaElement,
+    caretIndex: number | null
+  ): { contentHeight: number; caretTop: number | null; lineHeight: number } {
+    const styles = window.getComputedStyle(textarea);
+    const borderLeft = Number.parseFloat(styles.borderLeftWidth) || 0;
+    const borderRight = Number.parseFloat(styles.borderRightWidth) || 0;
+    const fontSize = Number.parseFloat(styles.fontSize) || 16;
+    const parsedLineHeight = Number.parseFloat(styles.lineHeight);
+    const lineHeight = Number.isFinite(parsedLineHeight) ? parsedLineHeight : fontSize * 1.2;
+    const mirror = this.getTextareaMirror();
+    mirror.replaceChildren();
+    Object.assign(mirror.style, {
+      position: "fixed",
+      zIndex: "-1",
+      top: "0",
+      left: "-10000px",
+      display: "block",
+      visibility: "hidden",
+      pointerEvents: "none",
+      boxSizing: styles.boxSizing,
+      width: `${textarea.clientWidth + borderLeft + borderRight}px`,
+      height: "auto",
+      minHeight: "0",
+      maxHeight: "none",
+      margin: "0",
+      padding: styles.padding,
+      borderWidth: styles.borderWidth,
+      borderStyle: styles.borderStyle,
+      borderColor: "transparent",
+      fontFamily: styles.fontFamily,
+      fontSize: styles.fontSize,
+      fontStyle: styles.fontStyle,
+      fontWeight: styles.fontWeight,
+      fontVariant: styles.fontVariant,
+      lineHeight: styles.lineHeight,
+      letterSpacing: styles.letterSpacing,
+      wordSpacing: styles.wordSpacing,
+      textAlign: styles.textAlign,
+      textIndent: styles.textIndent,
+      textTransform: styles.textTransform,
+      direction: styles.direction,
+      whiteSpace: "pre-wrap",
+      wordBreak: styles.wordBreak,
+      overflow: "hidden"
+    });
+    mirror.style.setProperty("overflow-wrap", styles.overflowWrap || "break-word");
+    mirror.style.setProperty("tab-size", styles.getPropertyValue("tab-size") || "8");
+
+    let marker: HTMLSpanElement | null = null;
+    if (caretIndex === null) {
+      mirror.append(document.createTextNode(`${textarea.value}\u200b`));
+    } else {
+      const safeIndex = Math.max(0, Math.min(caretIndex, textarea.value.length));
+      mirror.append(document.createTextNode(textarea.value.slice(0, safeIndex)));
+      marker = document.createElement("span");
+      marker.textContent = "\u200b";
+      marker.style.display = "inline-block";
+      marker.style.width = "0";
+      mirror.append(marker);
+      mirror.append(document.createTextNode(`${textarea.value.slice(safeIndex)}\u200b`));
+    }
+
+    const mirrorBounds = mirror.getBoundingClientRect();
+    const markerBounds = marker?.getBoundingClientRect();
+    return {
+      contentHeight: mirrorBounds.height,
+      caretTop: markerBounds ? markerBounds.top - mirrorBounds.top : null,
+      lineHeight
+    };
+  }
+
+  private getTextareaMirror(): HTMLDivElement {
+    if (this.textareaMirror?.isConnected) return this.textareaMirror;
+    const mirror = document.createElement("div");
+    mirror.className = "bianlitie-textarea-mirror";
+    mirror.setAttribute("aria-hidden", "true");
+    document.body.append(mirror);
+    this.textareaMirror = mirror;
+    return mirror;
+  }
+
   private registerViewportHandling(container: HTMLElement): void {
     this.viewportCleanup?.();
     const visualViewport = window.visualViewport;
-    const update = (): void => {
+    this.viewportBaselineHeight = visualViewport?.height ?? window.innerHeight;
+    this.viewportBaselineWidth = visualViewport?.width ?? window.innerWidth;
+
+    const evaluate = (confirmClose: boolean, adjustEditor: boolean): void => {
       const viewportHeight = visualViewport?.height ?? window.innerHeight;
-      const measuredInset = visualViewport
-        ? Math.max(0, window.innerHeight - viewportHeight)
-        : 0;
-      const keyboardHeight = measuredInset >= 72 ? measuredInset : 0;
+      const viewportWidth = visualViewport?.width ?? window.innerWidth;
+      const viewportOffsetTop = Math.max(0, visualViewport?.offsetTop ?? 0);
+      if (Math.abs(viewportWidth - this.viewportBaselineWidth) > 48) {
+        this.viewportBaselineWidth = viewportWidth;
+        this.viewportBaselineHeight = Math.max(viewportHeight, window.innerHeight);
+      }
+
+      const layoutHeight = Math.max(this.viewportBaselineHeight, window.innerHeight);
+      const heightLoss = Math.max(0, this.viewportBaselineHeight - viewportHeight);
+      const innerHeightLoss = Math.max(0, window.innerHeight - viewportHeight);
+      const bottomOcclusion = Math.max(0, layoutHeight - viewportHeight - viewportOffsetTop);
+      const measuredInset = Math.max(heightLoss, innerHeightLoss, bottomOcclusion);
       const wasKeyboardOpen = this.keyboardOpen;
-      const isKeyboardOpen = keyboardHeight > 0;
+      const isKeyboardOpen = measuredInset >= (wasKeyboardOpen ? 36 : 72);
+
+      if (wasKeyboardOpen && !isKeyboardOpen && !confirmClose) {
+        if (this.keyboardStateFrame === null) {
+          this.keyboardStateFrame = window.requestAnimationFrame(() => {
+            this.keyboardStateFrame = null;
+            evaluate(true, adjustEditor);
+          });
+        }
+        return;
+      }
+      if (isKeyboardOpen && this.keyboardStateFrame !== null) {
+        window.cancelAnimationFrame(this.keyboardStateFrame);
+        this.keyboardStateFrame = null;
+      }
+
       this.keyboardOpen = isKeyboardOpen;
+      if (!isKeyboardOpen && viewportHeight > this.viewportBaselineHeight) {
+        this.viewportBaselineHeight = viewportHeight;
+      }
+      const keyboardHeight = isKeyboardOpen ? measuredInset : 0;
       container.style.setProperty("--bianlitie-keyboard-height", `${Math.round(keyboardHeight)}px`);
       container.style.setProperty("--bianlitie-visual-viewport-height", `${Math.round(viewportHeight)}px`);
       container.toggleClass("is-keyboard-open", isKeyboardOpen);
-      if (wasKeyboardOpen && !isKeyboardOpen) this.scheduleKeyboardRecovery();
-      else if (isKeyboardOpen) {
+      const activeEditor = this.activeEditor;
+      const keyboardStateChanged = wasKeyboardOpen !== isKeyboardOpen;
+      if (activeEditor?.isConnected && (adjustEditor || keyboardStateChanged)) this.resizeMobileEditor(activeEditor);
+
+      if (wasKeyboardOpen && !isKeyboardOpen) {
+        container.style.removeProperty("--bianlitie-mobile-editor-max-height");
+        this.scheduleKeyboardRecovery();
+      } else if (isKeyboardOpen && (adjustEditor || keyboardStateChanged)) {
         if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
         this.keyboardRecoveryFrame = null;
         this.scheduleFocusedInputVisibility();
+        if (activeEditor?.isConnected) this.scheduleCaretVisibility(activeEditor);
       }
     };
+    const update = (): void => evaluate(false, true);
+    const updateScroll = (): void => evaluate(false, false);
 
     visualViewport?.addEventListener("resize", update);
-    visualViewport?.addEventListener("scroll", update);
+    visualViewport?.addEventListener("scroll", updateScroll);
     window.addEventListener("resize", update);
     this.viewportCleanup = () => {
       visualViewport?.removeEventListener("resize", update);
-      visualViewport?.removeEventListener("scroll", update);
+      visualViewport?.removeEventListener("scroll", updateScroll);
       window.removeEventListener("resize", update);
       container.style.removeProperty("--bianlitie-keyboard-height");
       container.style.removeProperty("--bianlitie-visual-viewport-height");
+      container.style.removeProperty("--bianlitie-mobile-editor-max-height");
       container.removeClass("is-keyboard-open");
+      if (this.keyboardStateFrame !== null) window.cancelAnimationFrame(this.keyboardStateFrame);
+      this.keyboardStateFrame = null;
       this.keyboardOpen = false;
     };
     update();
@@ -354,7 +531,40 @@ export class BianlitieView extends ItemView {
 
   private handleEditorFocus(textarea: HTMLTextAreaElement): void {
     this.activeEditor = textarea;
+    this.resizeMobileEditor(textarea);
+    if (!this.keyboardOpen) return;
     this.scheduleFocusedInputVisibility();
+    this.scheduleCaretVisibility(textarea);
+  }
+
+  private scheduleCaretVisibility(textarea: HTMLTextAreaElement): void {
+    if (!this.keyboardOpen || !window.matchMedia("(max-width: 600px)").matches) return;
+    if (this.caretFrame !== null) window.cancelAnimationFrame(this.caretFrame);
+    this.caretFrame = window.requestAnimationFrame(() => {
+      this.caretFrame = null;
+      this.keepCaretVisible(textarea);
+    });
+  }
+
+  private keepCaretVisible(textarea: HTMLTextAreaElement): void {
+    if (!this.keyboardOpen || !textarea.isConnected || textarea !== this.activeEditor) return;
+    if (!textarea.hasClass("is-mobile-editor-constrained")) return;
+
+    const { contentHeight, caretTop, lineHeight } = this.measureTextarea(textarea, textarea.selectionStart);
+    if (caretTop === null || contentHeight <= textarea.clientHeight + 1) return;
+    const safeInset = Math.max(20, lineHeight * 1.5);
+    const visibleTop = textarea.scrollTop + safeInset;
+    const visibleBottom = textarea.scrollTop + textarea.clientHeight - safeInset;
+    let nextScrollTop = textarea.scrollTop;
+    if (caretTop < visibleTop) {
+      nextScrollTop = caretTop - safeInset;
+    } else if (caretTop + lineHeight > visibleBottom) {
+      nextScrollTop = caretTop + lineHeight - textarea.clientHeight + safeInset;
+    }
+
+    const maxScrollTop = Math.max(0, contentHeight - textarea.clientHeight);
+    nextScrollTop = Math.max(0, Math.min(nextScrollTop, maxScrollTop));
+    if (Math.abs(nextScrollTop - textarea.scrollTop) >= 2) textarea.scrollTop = nextScrollTop;
   }
 
   private scheduleKeyboardRecovery(): void {
@@ -600,9 +810,12 @@ export class BianlitieView extends ItemView {
     textarea.value = draft.body;
     textarea.disabled = draft.saving;
     textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
+    textarea.addEventListener("click", () => this.scheduleCaretVisibility(textarea));
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
+      this.resizeMobileEditor(textarea);
     });
+    this.resizeMobileEditor(textarea);
 
     const extras = editor.createDiv({ cls: "bianlitie-draft-extras" });
     const tagHost = extras.createDiv();
@@ -1055,8 +1268,12 @@ export class BianlitieView extends ItemView {
     if (this.vaultRefreshTimer !== null) window.clearTimeout(this.vaultRefreshTimer);
     if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
     if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
+    if (this.keyboardStateFrame !== null) window.cancelAnimationFrame(this.keyboardStateFrame);
+    if (this.caretFrame !== null) window.cancelAnimationFrame(this.caretFrame);
     this.viewportFrame = null;
     this.keyboardRecoveryFrame = null;
+    this.keyboardStateFrame = null;
+    this.caretFrame = null;
     this.viewportCleanup?.();
     this.viewportCleanup = null;
     if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
@@ -1066,5 +1283,9 @@ export class BianlitieView extends ItemView {
     this.searchUi = null;
     this.activeEditor = null;
     this.keyboardOpen = false;
+    this.viewportBaselineHeight = 0;
+    this.viewportBaselineWidth = 0;
+    this.textareaMirror?.remove();
+    this.textareaMirror = null;
   }
 }
