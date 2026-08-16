@@ -743,9 +743,8 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.viewportBaselineWidth = 0;
     this.activeEditor = null;
     this.textareaMirror = null;
-    this.mobileFocusSession = null;
-    this.pendingMobileFocusScrollTop = null;
-    this.skipNextKeyboardRecovery = false;
+    this.mobileFullscreenSession = null;
+    this.preparedMobileScrollTop = null;
   }
   getViewType() {
     return VIEW_TYPE_BIANLITIE;
@@ -858,7 +857,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     textarea.addEventListener("input", () => this.resizeNoteInput(textarea));
     textarea.addEventListener("pointerdown", () => this.prepareMobileFocusEditor());
     textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
-    textarea.addEventListener("click", () => this.scheduleCaretVisibility(textarea));
+    textarea.addEventListener("click", () => this.handleEditorClick(textarea));
     this.registerDomEvent(window, "resize", () => this.resizeNoteInput(textarea));
     searchInput.addEventListener("input", () => {
       if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
@@ -871,7 +870,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       window.requestAnimationFrame(() => {
         this.resizeNoteInput(textarea, true);
         window.requestAnimationFrame(() => {
-          if (container.isConnected && !this.mobileFocusSession && document.activeElement !== textarea) {
+          if (container.isConnected && !this.mobileFullscreenSession && document.activeElement !== textarea) {
             container.scrollTop = 0;
           }
         });
@@ -964,36 +963,10 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     const minHeight = Number.parseFloat(styles.minHeight) || 116;
     const { contentHeight } = this.measureTextarea(textarea, null);
     const naturalHeight = Math.max(minHeight, Math.ceil(contentHeight));
-    if (!this.keyboardOpen) {
-      textarea.style.height = `${naturalHeight}px`;
-      textarea.style.maxHeight = "none";
-      textarea.style.overflowY = "hidden";
-      textarea.removeClass("is-mobile-editor-constrained");
-      textarea.scrollTop = 0;
-      return;
-    }
-    const maxHeight = this.calculateMobileEditorMaxHeight(minHeight);
-    const constrained = naturalHeight > maxHeight + 1;
-    textarea.style.height = `${Math.min(naturalHeight, maxHeight)}px`;
-    textarea.style.maxHeight = `${maxHeight}px`;
-    textarea.style.overflowY = constrained ? "auto" : "hidden";
-    textarea.toggleClass("is-mobile-editor-constrained", constrained);
-    this.searchUi?.scrollContainer.style.setProperty("--bianlitie-mobile-editor-max-height", `${maxHeight}px`);
-    if (!constrained) textarea.scrollTop = 0;
-  }
-  calculateMobileEditorMaxHeight(minHeight) {
-    const ui = this.searchUi;
-    const visualViewport = window.visualViewport;
-    if (!ui) return minHeight;
-    const viewportTop = visualViewport?.offsetTop ?? 0;
-    const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
-    const containerBounds = ui.scrollContainer.getBoundingClientRect();
-    const visibleTop = Math.max(viewportTop, containerBounds.top);
-    const visibleBottom = Math.min(viewportBottom, containerBounds.bottom);
-    const visibleHeight = Math.max(minHeight, visibleBottom - visibleTop);
-    const edgeLimitedHeight = visibleHeight - 56;
-    const comfortableHeight = visibleHeight * 0.68;
-    return Math.max(minHeight, Math.floor(Math.min(edgeLimitedHeight, comfortableHeight)));
+    textarea.style.height = `${naturalHeight}px`;
+    textarea.style.maxHeight = "none";
+    textarea.style.overflowY = "hidden";
+    textarea.scrollTop = 0;
   }
   measureTextarea(textarea, caretIndex) {
     const styles = window.getComputedStyle(textarea);
@@ -1112,25 +1085,17 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       container.style.setProperty("--bianlitie-visual-viewport-height", `${Math.round(viewportHeight)}px`);
       container.toggleClass("is-keyboard-open", isKeyboardOpen);
       const activeEditor = this.activeEditor;
-      const focusEditor = this.mobileFocusSession?.textarea;
+      const fullscreenEditor = this.mobileFullscreenSession?.textarea;
       const keyboardStateChanged = wasKeyboardOpen !== isKeyboardOpen;
-      if (focusEditor?.isConnected) this.updateMobileFocusEditorLayout();
+      if (fullscreenEditor?.isConnected) this.updateMobileFullscreenEditorViewport();
       else if (activeEditor?.isConnected && (adjustEditor || keyboardStateChanged)) this.resizeMobileEditor(activeEditor);
       if (wasKeyboardOpen && !isKeyboardOpen) {
-        container.style.removeProperty("--bianlitie-mobile-editor-max-height");
-        const exitedFocusEditor = this.exitMobileFocusEditor(true, false);
-        if (exitedFocusEditor) {
-          this.skipNextKeyboardRecovery = false;
-        } else if (this.skipNextKeyboardRecovery) {
-          this.skipNextKeyboardRecovery = false;
-        } else {
-          this.scheduleKeyboardRecovery();
-        }
+        if (!fullscreenEditor?.isConnected) this.scheduleKeyboardRecovery();
       } else if (isKeyboardOpen && (adjustEditor || keyboardStateChanged)) {
         if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
         this.keyboardRecoveryFrame = null;
-        if (focusEditor?.isConnected) {
-          this.scheduleCaretVisibility(focusEditor);
+        if (fullscreenEditor?.isConnected) {
+          this.scheduleCaretVisibility(fullscreenEditor);
         } else {
           this.scheduleFocusedInputVisibility();
           if (activeEditor?.isConnected) this.scheduleCaretVisibility(activeEditor);
@@ -1148,7 +1113,6 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       window.removeEventListener("resize", update);
       container.style.removeProperty("--bianlitie-keyboard-height");
       container.style.removeProperty("--bianlitie-visual-viewport-height");
-      container.style.removeProperty("--bianlitie-mobile-editor-max-height");
       container.removeClass("is-keyboard-open");
       if (this.keyboardStateFrame !== null) window.cancelAnimationFrame(this.keyboardStateFrame);
       this.keyboardStateFrame = null;
@@ -1166,123 +1130,141 @@ var BianlitieView = class extends import_obsidian7.ItemView {
   }
   handleEditorFocus(textarea) {
     this.activeEditor = textarea;
-    if (this.enterMobileFocusEditor(textarea)) return;
+    if (window.matchMedia("(max-width: 600px)").matches) return;
     this.resizeMobileEditor(textarea);
     if (!this.keyboardOpen) return;
     this.scheduleFocusedInputVisibility();
     this.scheduleCaretVisibility(textarea);
   }
   prepareMobileFocusEditor() {
-    if (!window.matchMedia("(max-width: 600px)").matches || this.mobileFocusSession) return;
-    this.pendingMobileFocusScrollTop = this.searchUi?.scrollContainer.scrollTop ?? null;
+    if (!window.matchMedia("(max-width: 600px)").matches || this.mobileFullscreenSession) return;
+    this.preparedMobileScrollTop = this.searchUi?.scrollContainer.scrollTop ?? null;
   }
-  enterMobileFocusEditor(source) {
+  handleEditorClick(textarea) {
+    if (this.enterMobileFullscreenEditor(textarea)) return;
+    this.scheduleCaretVisibility(textarea);
+  }
+  enterMobileFullscreenEditor(source) {
     if (!window.matchMedia("(max-width: 600px)").matches || !source.isConnected) return false;
-    if (this.mobileFocusSession?.source === source) return true;
-    if (this.mobileFocusSession) this.exitMobileFocusEditor(false, false);
+    if (this.mobileFullscreenSession?.source === source) return true;
+    if (this.mobileFullscreenSession) return false;
     const ui = this.searchUi;
     if (!ui) return false;
-    const outerScrollTop = this.pendingMobileFocusScrollTop ?? ui.scrollContainer.scrollTop;
-    this.pendingMobileFocusScrollTop = null;
+    const outerScrollTop = this.preparedMobileScrollTop ?? ui.scrollContainer.scrollTop;
+    this.preparedMobileScrollTop = null;
     if (this.viewportFrame !== null) window.cancelAnimationFrame(this.viewportFrame);
     if (this.keyboardRecoveryFrame !== null) window.cancelAnimationFrame(this.keyboardRecoveryFrame);
     this.viewportFrame = null;
     this.keyboardRecoveryFrame = null;
     const selectionStart = source.selectionStart;
     const selectionEnd = source.selectionEnd;
-    const overlay = document.createElement("div");
-    overlay.className = "bianlitie-mobile-focus-editor";
-    overlay.setAttribute("role", "dialog");
-    overlay.setAttribute("aria-label", "\u4E13\u6CE8\u7F16\u8F91\u4FBF\u5229\u8D34\u6B63\u6587");
+    const layer = document.createElement("div");
+    layer.className = "bianlitie-mobile-fullscreen-editor";
+    layer.setAttribute("role", "dialog");
+    layer.setAttribute("aria-modal", "true");
+    layer.setAttribute("aria-label", "\u5168\u5C4F\u7F16\u8F91\u4FBF\u5229\u8D34\u6B63\u6587");
+    const header = document.createElement("header");
+    header.className = "bianlitie-mobile-fullscreen-editor__header";
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.className = "bianlitie-mobile-fullscreen-editor__action";
+    cancelButton.textContent = "\u53D6\u6D88";
+    const title = document.createElement("strong");
+    title.className = "bianlitie-mobile-fullscreen-editor__title";
+    title.textContent = "\u7F16\u8F91\u6B63\u6587";
+    const doneButton = document.createElement("button");
+    doneButton.type = "button";
+    doneButton.className = "bianlitie-mobile-fullscreen-editor__action bianlitie-mobile-fullscreen-editor__action--done";
+    doneButton.textContent = "\u5B8C\u6210";
+    header.append(cancelButton, title, doneButton);
     const textarea = document.createElement("textarea");
-    textarea.className = "bianlitie-mobile-focus-editor__input";
-    textarea.setAttribute("aria-label", "\u4FBF\u5229\u8D34\u6B63\u6587\u4E13\u6CE8\u7F16\u8F91\u5668");
+    textarea.className = "bianlitie-mobile-fullscreen-editor__input";
+    textarea.setAttribute("aria-label", "\u4FBF\u5229\u8D34\u6B63\u6587\u5168\u5C4F\u7F16\u8F91\u5668");
     textarea.value = source.value;
-    overlay.append(textarea);
-    document.body.append(overlay);
-    let restoringOuterScroll = false;
-    const onOuterScroll = () => {
-      const session = this.mobileFocusSession;
-      if (!session || session.overlay !== overlay || restoringOuterScroll) return;
-      if (Math.abs(ui.scrollContainer.scrollTop - session.outerScrollTop) < 1) return;
-      restoringOuterScroll = true;
-      ui.scrollContainer.scrollTop = session.outerScrollTop;
-      restoringOuterScroll = false;
+    layer.append(header, textarea);
+    document.body.append(layer);
+    this.mobileFullscreenSession = {
+      source,
+      layer,
+      textarea,
+      outerScrollTop,
+      isComposing: false,
+      closing: false
     };
-    this.mobileFocusSession = { source, overlay, textarea, outerScrollTop, onOuterScroll };
-    ui.scrollContainer.addClass("is-mobile-focus-editor-active");
-    ui.scrollContainer.addEventListener("scroll", onOuterScroll, { passive: true });
-    ui.scrollContainer.scrollTop = outerScrollTop;
-    textarea.addEventListener("input", () => {
-      this.syncMobileFocusEditor();
-      this.updateMobileFocusEditorLayout();
+    ui.scrollContainer.addClass("is-mobile-fullscreen-editor-active");
+    ui.scrollContainer.setAttribute("inert", "");
+    textarea.addEventListener("compositionstart", () => {
+      const session = this.mobileFullscreenSession;
+      if (session?.textarea === textarea) session.isComposing = true;
+    });
+    textarea.addEventListener("compositionend", () => {
+      const session = this.mobileFullscreenSession;
+      if (session?.textarea === textarea) session.isComposing = false;
     });
     textarea.addEventListener("click", () => this.scheduleCaretVisibility(textarea));
     textarea.addEventListener("select", () => this.scheduleCaretVisibility(textarea));
-    overlay.addEventListener("pointerdown", (event) => {
-      if (event.target !== overlay) return;
-      event.preventDefault();
-      textarea.blur();
-      if (!this.keyboardOpen) this.exitMobileFocusEditor(true, true);
-    });
-    this.updateMobileFocusEditorLayout();
+    cancelButton.addEventListener("click", () => this.requestMobileFullscreenExit(false));
+    doneButton.addEventListener("click", () => this.requestMobileFullscreenExit(true));
+    this.updateMobileFullscreenEditorViewport();
     textarea.focus({ preventScroll: true });
     textarea.setSelectionRange(selectionStart, selectionEnd);
     this.scheduleCaretVisibility(textarea);
     return true;
   }
-  syncMobileFocusEditor() {
-    const session = this.mobileFocusSession;
-    if (!session || !session.source.isConnected) return;
-    const changed = session.source.value !== session.textarea.value;
-    session.source.value = session.textarea.value;
-    session.source.setSelectionRange(session.textarea.selectionStart, session.textarea.selectionEnd);
-    if (changed) session.source.dispatchEvent(new Event("input", { bubbles: true }));
+  requestMobileFullscreenExit(commit) {
+    const session = this.mobileFullscreenSession;
+    if (!session || session.closing) return;
+    session.closing = true;
+    if (session.isComposing) {
+      session.textarea.blur();
+      window.requestAnimationFrame(() => {
+        if (this.mobileFullscreenSession === session) this.closeMobileFullscreenEditor(commit, true);
+      });
+      return;
+    }
+    this.closeMobileFullscreenEditor(commit, true);
   }
-  updateMobileFocusEditorLayout() {
-    const session = this.mobileFocusSession;
+  updateMobileFullscreenEditorViewport() {
+    const session = this.mobileFullscreenSession;
     const ui = this.searchUi;
-    if (!session || !ui || !session.overlay.isConnected) return;
+    if (!session || !ui || !session.layer.isConnected) return;
     const visualViewport = window.visualViewport;
     const viewportTop = visualViewport?.offsetTop ?? 0;
+    const viewportLeft = visualViewport?.offsetLeft ?? 0;
     const viewportBottom = viewportTop + (visualViewport?.height ?? window.innerHeight);
+    const viewportRight = viewportLeft + (visualViewport?.width ?? window.innerWidth);
     const containerBounds = ui.scrollContainer.getBoundingClientRect();
-    const top = Math.max(viewportTop, containerBounds.top) + 12;
-    const bottom = Math.min(viewportBottom, containerBounds.bottom) - 12;
-    const left = containerBounds.left + 12;
-    const width = Math.max(120, containerBounds.width - 24);
-    const availableHeight = Math.max(116, bottom - top);
-    Object.assign(session.overlay.style, {
+    const top = Math.max(viewportTop, containerBounds.top);
+    const bottom = Math.min(viewportBottom, containerBounds.bottom);
+    const left = Math.max(viewportLeft, containerBounds.left);
+    const right = Math.min(viewportRight, containerBounds.right);
+    Object.assign(session.layer.style, {
       top: `${Math.round(top)}px`,
       left: `${Math.round(left)}px`,
-      width: `${Math.round(width)}px`,
-      height: `${Math.round(availableHeight)}px`
+      width: `${Math.max(1, Math.round(right - left))}px`,
+      height: `${Math.max(1, Math.round(bottom - top))}px`
     });
-    const styles = window.getComputedStyle(session.textarea);
-    const minHeight = Number.parseFloat(styles.minHeight) || 116;
-    const { contentHeight } = this.measureTextarea(session.textarea, null);
-    const maxHeight = Math.max(minHeight, availableHeight - 20);
-    const naturalHeight = Math.max(minHeight, Math.ceil(contentHeight));
-    const constrained = naturalHeight > maxHeight + 1;
-    session.textarea.style.height = `${Math.min(naturalHeight, maxHeight)}px`;
-    session.textarea.style.maxHeight = `${maxHeight}px`;
-    session.textarea.style.overflowY = constrained ? "auto" : "hidden";
-    session.textarea.toggleClass("is-mobile-editor-constrained", constrained);
-    if (!constrained) session.textarea.scrollTop = 0;
   }
-  exitMobileFocusEditor(restoreOuterScroll, suppressKeyboardRecovery) {
-    const session = this.mobileFocusSession;
+  closeMobileFullscreenEditor(commit, restoreOuterScroll) {
+    const session = this.mobileFullscreenSession;
     const ui = this.searchUi;
     if (!session) return false;
-    this.syncMobileFocusEditor();
-    if (suppressKeyboardRecovery && this.keyboardOpen) this.skipNextKeyboardRecovery = true;
-    this.mobileFocusSession = null;
+    this.mobileFullscreenSession = null;
     if (this.caretFrame !== null) window.cancelAnimationFrame(this.caretFrame);
     this.caretFrame = null;
-    ui?.scrollContainer.removeEventListener("scroll", session.onOuterScroll);
-    ui?.scrollContainer.removeClass("is-mobile-focus-editor-active");
-    session.overlay.remove();
-    if (session.source.isConnected) this.resizeMobileEditor(session.source);
+    session.textarea.blur();
+    ui?.scrollContainer.removeClass("is-mobile-fullscreen-editor-active");
+    ui?.scrollContainer.removeAttribute("inert");
+    session.layer.remove();
+    if (session.source.isConnected) {
+      if (commit) {
+        const changed = session.source.value !== session.textarea.value;
+        session.source.value = session.textarea.value;
+        session.source.setSelectionRange(session.textarea.selectionStart, session.textarea.selectionEnd);
+        if (changed) session.source.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      this.resizeMobileEditor(session.source);
+    }
     if (restoreOuterScroll && ui?.scrollContainer.isConnected) {
       window.requestAnimationFrame(() => {
         if (ui.scrollContainer.isConnected) ui.scrollContainer.scrollTop = session.outerScrollTop;
@@ -1299,11 +1281,8 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     });
   }
   keepCaretVisible(textarea) {
-    const isSourceEditor = textarea === this.activeEditor;
-    const isFocusEditor = textarea === this.mobileFocusSession?.textarea;
-    if (!textarea.isConnected || !isSourceEditor && !isFocusEditor) return;
-    if (!this.keyboardOpen && !isFocusEditor) return;
-    if (!textarea.hasClass("is-mobile-editor-constrained")) return;
+    const isFullscreenEditor = textarea === this.mobileFullscreenSession?.textarea;
+    if (!textarea.isConnected || !isFullscreenEditor || !this.keyboardOpen) return;
     const { contentHeight, caretTop, lineHeight } = this.measureTextarea(textarea, textarea.selectionStart);
     if (caretTop === null || contentHeight <= textarea.clientHeight + 1) return;
     const safeInset = Math.max(20, lineHeight * 1.5);
@@ -1330,6 +1309,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
   recoverActiveEditorPosition() {
     const editor = this.activeEditor;
     if (this.keyboardOpen || !editor?.isConnected) return;
+    if (document.activeElement !== editor) return;
     if (!editor.matches(".bianlitie-note-input, .bianlitie-draft-input")) return;
     this.positionEditorNearViewportTop(editor, false);
   }
@@ -1368,7 +1348,6 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     }
   }
   async saveNote(textarea, button, categoryButtons, searchInput, resultStatus, resultList, tagHost, imageHost, tagActionHost, imageActionHost) {
-    this.exitMobileFocusEditor(true, true);
     const originalContent = textarea.value;
     const composerDraft = this.composerDraft;
     if (!composerDraft || composerDraft.saving) return;
@@ -1533,7 +1512,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     textarea.disabled = draft.saving;
     textarea.addEventListener("pointerdown", () => this.prepareMobileFocusEditor());
     textarea.addEventListener("focus", () => this.handleEditorFocus(textarea));
-    textarea.addEventListener("click", () => this.scheduleCaretVisibility(textarea));
+    textarea.addEventListener("click", () => this.handleEditorClick(textarea));
     textarea.addEventListener("input", () => {
       if (this.draft?.path === draft.path && !this.draft.saving) this.draft.body = textarea.value;
       this.resizeMobileEditor(textarea);
@@ -1761,14 +1740,12 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     }
   }
   cancelDraft(path) {
-    this.exitMobileFocusEditor(true, true);
     if (this.draft?.path !== path || this.draft.saving) return;
     this.revokePendingImages(this.draft.pendingImages);
     this.draft = null;
     void this.refreshResults(false);
   }
   async saveDraft(path) {
-    this.exitMobileFocusEditor(true, true);
     const draft = this.draft;
     if (!draft || draft.path !== path || draft.saving) return;
     const current = this.app.vault.getAbstractFileByPath(path);
@@ -1939,7 +1916,11 @@ var BianlitieView = class extends import_obsidian7.ItemView {
       const textarea = this.searchUi?.list.querySelector(".bianlitie-draft-input");
       if (!textarea) return;
       this.activeEditor = textarea;
-      if (window.matchMedia("(max-width: 600px)").matches) this.positionEditorNearViewportTop(textarea, true);
+      if (window.matchMedia("(max-width: 600px)").matches) {
+        this.resizeMobileEditor(textarea);
+        this.positionEditorNearViewportTop(textarea, true);
+        return;
+      }
       textarea.focus({ preventScroll: true });
     });
   }
@@ -1954,7 +1935,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.keyboardRecoveryFrame = null;
     this.keyboardStateFrame = null;
     this.caretFrame = null;
-    this.exitMobileFocusEditor(false, false);
+    this.closeMobileFullscreenEditor(false, false);
     this.viewportCleanup?.();
     this.viewportCleanup = null;
     if (this.composerDraft) this.revokePendingImages(this.composerDraft.pendingImages);
@@ -1968,8 +1949,7 @@ var BianlitieView = class extends import_obsidian7.ItemView {
     this.viewportBaselineWidth = 0;
     this.textareaMirror?.remove();
     this.textareaMirror = null;
-    this.pendingMobileFocusScrollTop = null;
-    this.skipNextKeyboardRecovery = false;
+    this.preparedMobileScrollTop = null;
   }
 };
 
